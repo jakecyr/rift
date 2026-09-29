@@ -12,6 +12,8 @@ from pathlib import Path
 from rift import __version__
 
 PROVIDERS = ("openai", "anthropic", "grok", "ollama")
+EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = "medium"
 DEFAULT_MODELS = {
     "openai": "gpt-6-astra",
     "anthropic": "claude-sonnet-5-5",
@@ -41,6 +43,7 @@ class Settings:
     allow_outside: bool
     verbose: bool
     doctor: bool
+    effort: str = DEFAULT_EFFORT
     constraints: list[str] = field(default_factory=list)
     task: str = ""
     key_status: dict[str, bool] = field(default_factory=dict)
@@ -68,6 +71,11 @@ def main_parser() -> argparse.ArgumentParser:
     parser.add_argument("task", nargs="*", help="Task to run. Omit it to open the REPL.")
     parser.add_argument("--provider", choices=PROVIDERS, help="Model that writes code and tool arguments.")
     parser.add_argument("--model", help="Generation model id. Defaults depend on the provider.")
+    parser.add_argument(
+        "--effort",
+        choices=EFFORTS,
+        help="Reasoning effort for the writer: off, low, medium, high, xhigh, max.",
+    )
     parser.add_argument("--fast-provider", choices=PROVIDERS, help="Provider for the cheaper generation model.")
     parser.add_argument("--fast-model", help="Cheaper model. Jev routes between this and --model.")
     parser.add_argument("--base-url", help="OpenAI-compatible base URL for the main model.")
@@ -87,9 +95,9 @@ def main_parser() -> argparse.ArgumentParser:
 
 
 def load_settings(argv: list[str] | None = None) -> Settings:
-    args = main_parser().parse_args(argv)
-    cwd = Path.cwd()
-    env_files = env_file_candidates(cwd, find_project_env(), user_env_path())
+    args: argparse.Namespace = main_parser().parse_args(argv)
+    cwd: Path = Path.cwd()
+    env_files: list[Path] = env_file_candidates(cwd, find_project_env(), user_env_path())
     env = merge_env(env_files, os.environ)
     prefs = load_prefs()
     provider, model = choose_model(
@@ -117,6 +125,7 @@ def load_settings(argv: list[str] | None = None) -> Settings:
         jev_model = str(prefs["jev_model"])
     else:
         jev_model = "jev-latest"
+    effort = _choose_effort(args.effort, prefs)
     return _settings_from_env(
         env,
         env_files=env_files,
@@ -137,6 +146,7 @@ def load_settings(argv: list[str] | None = None) -> Settings:
         doctor=args.doctor,
         constraints=list(args.constraint),
         task=" ".join(args.task).strip(),
+        effort=effort,
     )
 
 
@@ -164,6 +174,7 @@ def refresh_settings(settings: Settings) -> None:
         doctor=settings.doctor,
         constraints=list(settings.constraints),
         task=settings.task,
+        effort=settings.effort,
     )
     for name in (
         "api_key",
@@ -207,6 +218,7 @@ def _settings_from_env(env: dict[str, str], env_files: list[Path], **kwargs: obj
         task=str(kwargs["task"]),
         key_status=_key_status(env),
         env_files=[str(path) for path in env_files if path.is_file()],
+        effort=_choose_effort(str(kwargs["effort"]) if kwargs.get("effort") else None, {}),
     )
 
 
@@ -307,6 +319,15 @@ def save_user_key(kind: str, value: str, path: Path | None = None) -> None:
     lines = [f"{key}={existing[key]}" for key in existing]
     file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     file.chmod(0o600)
+
+
+def _choose_effort(flag: str | None, prefs: dict) -> str:
+    if flag in EFFORTS:
+        return flag
+    saved = prefs.get("effort")
+    if isinstance(saved, str) and saved in EFFORTS:
+        return saved
+    return DEFAULT_EFFORT
 
 
 def choose_model(

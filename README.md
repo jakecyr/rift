@@ -56,7 +56,7 @@ rift --provider ollama --model qwen2.5-coder "Explain this repository"
 rift --fast-model gpt-4.1-mini "Rename the helper and update callers"
 ```
 
-Inside the prompt: `/model`, `/provider`, `/fast`, `/key`, `/cd`, `/clear`, `/doctor`, `/help`, `/quit`. Up-arrow recalls history. Tab completes commands. `test` runs the project's test command instead of opening test files.
+Inside the prompt: `/model`, `/provider`, `/fast`, `/key`, `/cd`, `/clear`, `/doctor`, `/help`, `/quit`. `!ls` runs that command in the workspace and keeps the output for the next task. Up-arrow recalls history. Tab completes commands. `test` runs the project's test command instead of opening test files.
 
 `AGENTS.md` and `CLAUDE.md` are loaded automatically: `~/.config/opencode/AGENTS.md`, `~/.claude/CLAUDE.md`, then each directory from your home folder down to the workspace. When a directory has both, both are included and the nearer file comes last.
 

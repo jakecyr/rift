@@ -14,12 +14,22 @@ from rift.decisions import (
     DecisionError,
     GateDecision,
 )
+from rift.gitstatus import (
+    GitPlan,
+    GitSnapshot,
+    capture_git,
+    git_add_command,
+    git_commit_command,
+    mixed_shell_problem,
+    plan_git,
+)
 from rift.llm import GenerationError
 from rift.prompt import argument_system
 from rift.safety import Verdict, allow, block, classify_path, classify_shell, confirm
 from rift.state import (
     ASK_SYSTEM,
     BASE_CONSTRAINTS,
+    COMMIT_SYSTEM,
     SUMMARY_SYSTEM,
     Observation,
     View,
@@ -42,18 +52,44 @@ class Agent:
         self.ui = ui
         self.settings = settings
         self.prior: list[str] = []
+        self.last_goal: str = ""
         self._held_edits = 0
+        self._blocks = 0
+        self._failures = 0
 
     def run_task(self, goal: str) -> str:
+        incoming = goal.strip()
+        if self.last_goal and _is_retry_request(incoming):
+            goal = self.last_goal
+        else:
+            goal = incoming
+            self.last_goal = goal
         started = self.llm.meter.snapshot()
+        self._blocks = 0
+        self._failures = 0
+        self._held_edits = 0
+        snapshot: GitSnapshot = capture_git(self.workspace.root)
         view = View(
-            goal=goal.strip(),
+            goal=goal,
             constraints=[*BASE_CONSTRAINTS, *self.settings.constraints],
             workspace=str(self.workspace.root),
             tree=self.workspace.tree(),
             project_instructions=project_instructions(self.workspace.root),
+            snapshot=snapshot.text,
             prior_tasks=list(self.prior),
         )
+        self.last_view = view
+        git_plan = plan_git(view.goal, self.workspace.root, snapshot)
+        if git_plan is not None:
+            summary = ""
+            try:
+                summary = self._run_git_task(view, git_plan)
+            except GenerationError as error:
+                self.ui.error(str(error))
+                summary = self._stop(str(error), view)
+            except KeyboardInterrupt:
+                summary = self._stop("interrupted", view)
+            return self._finish_run(started, view, summary)
         files_changed: list[str] = []
         seen: dict[str, int] = {}
         done_attempts = 0
@@ -96,6 +132,16 @@ class Agent:
                         action = ActionDecision(
                             "replace_text", 0.95, {"replace_text": 0.95}, action.tier, action.request_id
                         )
+                if (
+                    wants_project_guide(view.goal)
+                    and not _guide_sources_loaded(view)
+                    and action.name in {"write_file", "edit_file", "edit_batch", "done"}
+                ):
+                    view.guidance = (
+                        "Read README.md and pyproject.toml before writing the instruction file. "
+                        "Name this repo's layout and test command. Do not write generic advice."
+                    )
+                    action = ActionDecision("read_file", 0.95, {"read_file": 0.95}, action.tier, action.request_id)
                 self.ui.decision(
                     step,
                     action.name,
@@ -154,12 +200,11 @@ class Agent:
                         continue
                 args, refusal = self._arguments(view, action)
                 if refusal is not None:
-                    view.observations.append(refusal)
-                    self.ui.info(f"        {refusal.summary}: {clip(refusal.detail, 200)}")
-                    continue
-                assert args is not None
-                signature = action.name + ":" + json.dumps(args, sort_keys=True, default=str)[:800]
-                if action.name != "shell":
+                    signature = action.name + ":refusal:" + clip(refusal.detail, 800)
+                else:
+                    assert args is not None
+                    signature = action.name + ":" + json.dumps(args, sort_keys=True, default=str)[:800]
+                if refusal is not None or action.name != "shell":
                     seen[signature] = seen.get(signature, 0) + 1
                     if seen[signature] > 1:
                         view.observations.append(
@@ -176,7 +221,15 @@ class Agent:
                             summary = self._stop("repeated the same action", view)
                             break
                         continue
+                if refusal is not None:
+                    view.observations.append(refusal)
+                    self.ui.info(f"        {refusal.summary}: {clip(refusal.detail, 200)}")
+                    continue
+                assert args is not None
                 if not self._permit(view, state, action.name, args):
+                    if self._blocks >= 2:
+                        summary = self._stop("policy blocked an action twice", view)
+                        break
                     continue
                 result = self._execute(action.name, args)
                 preview = json.dumps(_preview_args(args), default=str)
@@ -211,8 +264,16 @@ class Agent:
                         view.remember_file(rel, result.detail)
                 if result.ok:
                     self._held_edits = 0
+                    self._failures = 0
+                else:
+                    self._failures += 1
+                    if self._failures >= 2:
+                        view.guidance = (
+                            "Those actions failed. Do not repeat them. "
+                            "Use the error output for one narrower step, or ask_user."
+                        )
                 executed += 1
-                if result.ok and executed % 4 == 0:
+                if executed % 4 == 0:
                     stuck_strikes = self._check_progress(view, stuck_strikes)
             else:
                 summary = self._stop("step limit reached", view)
@@ -221,7 +282,95 @@ class Agent:
             summary = self._stop(str(error), view)
         except KeyboardInterrupt:
             summary = self._stop("interrupted", view)
-        self.ui.stats(self.llm.meter.delta(started), files_changed)
+        return self._finish_run(started, view, summary, files_changed)
+
+    def _run_git_task(self, view: View, plan: GitPlan) -> str:
+        """Review from the snapshot, then stage and commit when that was the request.
+
+        The diff is already captured. The only writes are git add and git commit.
+        """
+        if not plan.is_repo:
+            return self._stop(view.snapshot or "this workspace is not a git repository", view)
+        if plan.commit and self.settings.read_only:
+            return self._stop("committing needs shell, and this session is read-only", view)
+        if plan.held:
+            view.guidance = "Left unstaged because they look like secrets: " + ", ".join(plan.held)
+        if plan.commit and not plan.paths:
+            note = "Nothing to commit."
+            if plan.held:
+                note += " Left unstaged: " + ", ".join(plan.held) + "."
+            self.ui.finished(note)
+            return note
+        if plan.commit:
+            message = self._commit_message(view)
+            if not self._run_git_command(view, git_add_command(plan.paths), 1):
+                return self._stop("git add failed", view)
+            commit = git_commit_command(message)
+            if not self._run_git_command(view, commit, 2):
+                if _needs_identity(view):
+                    commit = git_commit_command(message, identity=True)
+                    if not self._run_git_command(view, commit, 3):
+                        return self._stop("git commit failed", view)
+                else:
+                    return self._stop("git commit failed", view)
+            view.files_changed = list(plan.paths)
+            note = "The commit succeeded. Summarize the diff from the snapshot and the subject. The snapshot is the work that was committed."
+            if plan.held:
+                note += " Left unstaged: " + ", ".join(plan.held) + "."
+            view.guidance = note
+        elif not plan.paths and not plan.held:
+            note = "No uncommitted changes."
+            self.ui.finished(note)
+            return note
+        result = self.llm.complete(
+            "powerful",
+            SUMMARY_SYSTEM,
+            llm_user_message(view, "done", "Plain text summary of the diff and the commit."),
+            800,
+            0.2,
+        )
+        self.ui.finished(result.text)
+        return result.text.strip()
+
+    def _commit_message(self, view: View) -> str:
+        """One subject line. An empty reply falls back so add and commit still run."""
+        prompt = llm_user_message(view, "commit", "One subject line.")
+        for effort in ("low", "off"):
+            try:
+                result = self.llm.complete(
+                    "powerful",
+                    COMMIT_SYSTEM,
+                    prompt,
+                    2048,
+                    0.2,
+                    effort=effort,
+                )
+            except GenerationError:
+                continue
+            line = _commit_subject(result.text)
+            if line:
+                return line
+        return "Apply the current workspace changes"
+
+    def _run_git_command(self, view: View, command: str, step: int) -> bool:
+        verdict = classify_shell(command)
+        if verdict.level == "block":
+            self.ui.rule("block", verdict.reason)
+            view.observations.append(Observation("shell", command, "blocked", verdict.reason, False))
+            return False
+        if verdict.level == "confirm" or self.settings.confirm_mutations:
+            if not self.ui.confirm(self._confirm_message("shell", {"command": command}), True):
+                view.observations.append(Observation("shell", command, "denied", "a person denied this action", False))
+                return False
+        self.ui.decision(step, "shell", 1.0, "powerful", {"shell": 1.0}, "")
+        result = self._execute("shell", {"command": command, "timeout_sec": 120})
+        view.observations.append(Observation("shell", command, result.summary, result.detail, result.ok))
+        self.ui.tool("shell", result.summary, result.detail)
+        return result.ok
+
+    def _finish_run(self, started, view: View, summary: str, files_changed: list[str] | None = None) -> str:
+        files = list(view.files_changed if files_changed is None else files_changed)
+        self.ui.stats(self.llm.meter.delta(started), files)
         if summary:
             note = clip(summary, 500)
             if note not in self.prior:
@@ -279,10 +428,24 @@ class Agent:
                 "Set command to the test command in the project instructions when one is given. "
                 "Otherwise use the runner this repo already uses. Use python3, not python."
             )
+        if action.name == "shell":
+            user += "\n\nRun one command. Do not chain git with a test runner."
         if action.name == "replace_text":
             user += (
                 "\n\nSet old and new from the user message. "
                 "One call replaces the text in every file and in file names. Leave glob empty."
+            )
+        if action.name in {"write_file", "edit_file"}:
+            user += (
+                "\n\nThis tool accepts only one path. "
+                "Fill the single next file that is not already written. "
+                "Do not return need ask_user because other files remain."
+            )
+        if action.name in {"write_file", "edit_file"} and wants_project_guide(view.goal):
+            user += (
+                "\n\nThis file is a project guide. Use facts from the loaded README and project files: "
+                "the test command, the package layout, and the conventions. "
+                "Do not write generic advice such as 'follow existing conventions' with no command or path."
             )
         max_tokens = 16384 if action.name in {"edit_file", "write_file", "edit_batch"} else 2048
         self.ui.status(f"        writing arguments with {self._model_name(action.tier)}")
@@ -307,13 +470,26 @@ class Agent:
         normalized, error = normalize_args(action.name, args)
         if error:
             return None, Observation(action.name, "", "invalid arguments", error, False)
+        if action.name == "shell" and normalized is not None:
+            problem = mixed_shell_problem(str(normalized.get("command", "")))
+            if problem:
+                return None, Observation(action.name, "", "invalid arguments", problem, False)
         return normalized, None
 
     def _permit(self, view: View, state: dict, tool: str, args: dict) -> bool:
         code = self._code_verdict(tool, args)
         if code.level == "block":
+            self._blocks += 1
             self.ui.rule("block", code.reason)
-            view.observations.append(Observation(tool, _args_text(args), "blocked", code.reason, False))
+            view.observations.append(
+                Observation(
+                    tool,
+                    _args_text(args),
+                    "blocked",
+                    code.reason + " Do not retry this command.",
+                    False,
+                )
+            )
             return False
         gate: GateDecision | None = None
         if tool in MUTATING:
@@ -331,9 +507,20 @@ class Agent:
                 return False
             self.ui.gate(gate.action, gate.destructive, "")
             if gate.action == "block":
+                self._blocks += 1
                 view.observations.append(
-                    Observation(tool, _args_text(args), "blocked by policy", "Jev blocked this action", False)
+                    Observation(
+                        tool,
+                        _args_text(args),
+                        "blocked by policy",
+                        (
+                            f"Jev blocked this {tool} (destructive {gate.destructive:.2f}). "
+                            "Do not retry it. Choose a different action."
+                        ),
+                        False,
+                    )
                 )
+                view.guidance = "The last action was blocked. Do not retry it."
                 return False
         need_human = code.level == "confirm"
         if self.settings.confirm_mutations and tool in MUTATING:
@@ -526,6 +713,67 @@ class Agent:
         return text
 
 
+_AGAIN = ("again", "agaon", "agian", "agin")
+_RETRY_FILLERS = ("please ", "can you ", "could you ", "just ")
+
+
+def _retry_phrases() -> set[str]:
+    phrases = {"retry", "retry that", "retry it", "same thing"}
+    for word in _AGAIN:
+        phrases.update(
+            {
+                f"try {word}",
+                f"try that {word}",
+                f"try it {word}",
+                f"do that {word}",
+                f"do it {word}",
+                f"run that {word}",
+                f"run it {word}",
+                f"same thing {word}",
+            }
+        )
+    return phrases
+
+
+_RETRY_PHRASES = _retry_phrases()
+
+
+def _is_retry_request(goal: str) -> bool:
+    """True when the whole message asks to repeat the previous goal.
+
+    A coding request that merely contains "again" or "retry" stays a new task.
+    """
+    text = " ".join(goal.strip().lower().split())
+    text = text.strip("\"'`")
+    text = text.rstrip(".!?").strip()
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _RETRY_FILLERS:
+            if text.startswith(prefix):
+                text = text[len(prefix) :].strip()
+                changed = True
+    if text.endswith(" please"):
+        text = text[: -len(" please")].strip()
+    return text in _RETRY_PHRASES
+
+
+def _commit_subject(text: str) -> str:
+    lines = text.strip().splitlines()
+    line = lines[0].strip().strip("\"'`") if lines else ""
+    if not line or line.startswith("{"):
+        return ""
+    return line[:72]
+
+
+def _needs_identity(view: View) -> bool:
+    if not view.observations:
+        return False
+    last = view.observations[-1]
+    text = f"{last.summary}\n{last.detail}".lower()
+    return "please tell me who you are" in text or "user.name" in text or "user.email" in text
+
+
 def fallback_action(action: ActionDecision) -> ActionDecision | None:
     """When an edit is too uncertain, take the best read instead of spinning."""
     best_name = ""
@@ -552,6 +800,17 @@ def _spec_is_loaded(view: View) -> bool:
 def _ranked(probabilities: dict[str, float]) -> str:
     ordered = sorted(probabilities.items(), key=lambda item: -item[1])[:4]
     return ", ".join(f"{name}={prob:.2f}" for name, prob in ordered)
+
+
+def wants_project_guide(goal: str) -> bool:
+    """The user asked for a project instruction file, which has to describe this repo."""
+    text = goal.lower()
+    return "agents.md" in text or "claude.md" in text
+
+
+def _guide_sources_loaded(view: View) -> bool:
+    loaded = {path.rsplit("/", 1)[-1].lower() for path in view.loaded}
+    return "readme.md" in loaded or "pyproject.toml" in loaded
 
 
 def wants_repo_replace(goal: str) -> bool:

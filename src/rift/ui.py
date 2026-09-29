@@ -12,7 +12,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from rift.llm import UsageMeter
+from rift.llm import JEV_USD_PER_MILLION_INPUT, UsageMeter
 
 
 class UI:
@@ -22,9 +22,9 @@ class UI:
         assume_yes: bool = False,
         console: Console | None = None,
     ) -> None:
-        self.verbose = verbose
-        self.assume_yes = assume_yes
-        self.console = console or Console()
+        self.verbose: bool = verbose
+        self.assume_yes: bool = assume_yes
+        self.console: Console = console or Console()
         self.session = None
         self._in_tty = sys.stdin.isatty()
 
@@ -54,6 +54,7 @@ class UI:
         rows = [
             ("/provider", "show or set openai, anthropic, grok, ollama"),
             ("/model", "show or set the writer model"),
+            ("/effort", "reasoning level: off, low, medium, high, xhigh, max"),
             ("/fast", "cheaper model for Jev to route to, or /fast off"),
             ("/key", "set openai, anthropic, grok, or jev key"),
             ("/jev", "Jev model id"),
@@ -66,12 +67,16 @@ class UI:
             ("/verbose", "toggle Jev probabilities"),
             ("/doctor", "which keys are set"),
             ("/status", "show the current session"),
+            ("!", "run a shell command and keep the output for the next task"),
             ("/quit", "leave"),
         ]
         for command, description in rows:
             table.add_row(command, description)
         self.console.print(Panel(table, title="commands", border_style="cyan", padding=(1, 1)))
-        self.console.print("[dim]Anything else is a task. test runs the project's tests. Up-arrow recalls history.[/]")
+        self.console.print(
+            "[dim]Anything else is a task. !command runs in this workspace. test runs the project's tests. "
+            "Up-arrow recalls history.[/]"
+        )
 
     def doctor(self, settings) -> None:
         grid = Table.grid(padding=(0, 2))
@@ -195,6 +200,11 @@ class UI:
         if len(lines) > limit:
             self.console.print(f"  [dim]+{len(lines) - limit} lines[/]")
 
+    def command_result(self, command: str, summary: str, detail: str) -> None:
+        self.console.print(f"\n[bold]![/] {escape(command)}", highlight=False)
+        self.console.print(f"  {escape(summary)}", highlight=False)
+        self._body(detail, 40)
+
     def info(self, text: str) -> None:
         self.console.print(f"  {escape(text)}")
 
@@ -234,7 +244,7 @@ class UI:
         self.console.print(Panel(escape(summary.strip()), title="done", border_style="green", padding=(1, 2)))
 
     def stats(self, meter: UsageMeter, files: list[str]) -> None:
-        cost = meter.jev_input_tokens / 1_000_000 * 0.042
+        cost = meter.jev_input_tokens / 1_000_000 * JEV_USD_PER_MILLION_INPUT
         parts = [f"jev {meter.jev_calls}", f"writer {meter.llm_calls}"]
         if files:
             parts.append(f"{len(files)} files")

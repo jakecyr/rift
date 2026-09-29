@@ -16,15 +16,17 @@ from typesafe_sdk import TypeSafeClient
 
 from rift.config import (
     DEFAULT_MODELS,
+    EFFORTS,
     PROVIDERS,
     refresh_settings,
     save_prefs,
     save_user_key,
     user_config_dir,
 )
-from rift.llm import LLM, Profile
+from rift.llm import LLM, Profile, session_costs
 from rift.tools import Workspace
 from rift.ui import short_path
+from rift.util import clip
 
 
 class App:
@@ -69,6 +71,7 @@ class App:
                 "fast_model": self.settings.fast_model or "",
                 "fast_provider": self.settings.fast_provider or "",
                 "jev_model": self.settings.jev_model,
+                "effort": self.settings.effort,
             },
             path=self.prefs_file,
         )
@@ -84,7 +87,7 @@ def llm_from_settings(settings, meter) -> LLM:
             settings.fast_api_key,
             settings.fast_base_url,
         )
-    return LLM(powerful, fast, meter)
+    return LLM(powerful, fast, meter, effort=getattr(settings, "effort", "medium"))
 
 
 def handle_command(app: App, line: str) -> bool:
@@ -115,6 +118,8 @@ def handle_command(app: App, line: str) -> bool:
         return True
     if command == "/clear":
         app.agent.prior.clear()
+        if hasattr(app.agent, "last_goal"):
+            app.agent.last_goal = ""
         app.ui.clear()
         _show_status(app)
         return True
@@ -141,6 +146,9 @@ def handle_command(app: App, line: str) -> bool:
         return True
     if command == "/model":
         _set_model(app, args)
+        return True
+    if command == "/effort":
+        _set_effort(app, args)
         return True
     if command == "/fast":
         _set_fast(app, args)
@@ -183,6 +191,12 @@ def run_repl(app: App) -> int:
             return 0
         if not line:
             continue
+        if line.startswith("!"):
+            try:
+                run_bang(app, line)
+            except KeyboardInterrupt:
+                app.ui.error("interrupted")
+            continue
         if line.startswith("/"):
             try:
                 if not handle_command(app, line):
@@ -194,6 +208,22 @@ def run_repl(app: App) -> int:
             app.agent.run_task(line)
         except KeyboardInterrupt:
             app.ui.error("interrupted")
+
+
+def run_bang(app: App, line: str) -> None:
+    """Run a command the user typed after ! and keep the output for the next task."""
+    command = line[1:].strip()
+    if not command:
+        app.ui.error("Type a command after !.")
+        return
+    result = app.agent.workspace.shell(command, 120, approved=True)
+    app.ui.command_result(command, result.summary, result.detail)
+    if result.summary == "blocked":
+        return
+    note = clip(f"User ran `{command}`\n{result.summary}\n{result.detail}", 4000)
+    if note not in app.agent.prior:
+        app.agent.prior.append(note)
+    app.agent.prior = app.agent.prior[-6:]
 
 
 def _show_status(app: App) -> None:
@@ -242,6 +272,20 @@ def _set_model(app: App, args: list[str]) -> None:
     app.rebuild_writer()
     app.remember()
     app.ui.info(f"model {app.settings.model}")
+
+
+def _set_effort(app: App, args: list[str]) -> None:
+    if not args:
+        app.ui.info(app.settings.effort)
+        return
+    level = args[0].lower()
+    if level not in EFFORTS:
+        app.ui.error("Effort is off, low, medium, high, xhigh, or max.")
+        return
+    app.settings.effort = level
+    app.agent.llm.effort = level
+    app.remember()
+    app.ui.info(f"effort {level}")
 
 
 def _set_fast(app: App, args: list[str]) -> None:
@@ -329,8 +373,11 @@ def _set_workspace(app: App, args: list[str]) -> None:
 
 def _toolbar(app: App) -> HTML:
     workspace = short_path(app.settings.workspace)
+    jev, writer = session_costs(app.agent.llm.meter, app.settings.provider, app.settings.model)
+    effort = f" ({app.settings.effort})" if getattr(app.settings, "effort", "") else ""
     return HTML(
-        f" <b>{app.settings.provider}</b> {app.settings.model}"
+        f" <b>{app.settings.provider}</b> {app.settings.model}{effort}"
+        f"   jev ${jev:.4f} · writer ${writer:.4f}"
         f"   <b>cwd</b> {workspace}"
         "   <b>/help</b> "
     )
@@ -345,6 +392,7 @@ def _completer() -> NestedCompleter:
             "/provider": providers,
             "/backend": providers,
             "/model": None,
+            "/effort": {level: None for level in EFFORTS},
             "/fast": {"off": None},
             "/key": {"openai": None, "anthropic": None, "grok": None, "jev": None},
             "/jev": None,

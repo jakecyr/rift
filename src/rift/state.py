@@ -21,11 +21,17 @@ Return one JSON object and no other text.
 Do not choose a different tool.
 old_string must be copied exactly from the loaded file text, including whitespace.
 If the loaded text is missing or truncated so you cannot copy an exact snippet, return {"need":"read_file","path":"the/file","reason":"why"}.
-If the tool cannot be filled, return {"need":"ask_user","path":"","reason":"why"}."""
+write_file and edit_file take one path. When the goal needs several files, fill the single next file that is not already in files changed. Do not return {"need":"ask_user"} because other files remain. The loop will call you again for the rest.
+If the tool cannot be filled for any other reason, return {"need":"ask_user","path":"","reason":"why"}."""
 
 SUMMARY_SYSTEM = """Write a short completion note for the user.
 Plain text, no JSON. Say what changed, which files, and anything left unfinished.
 Stay under 150 words."""
+
+COMMIT_SYSTEM = """Write one git commit subject for the diff in the workspace snapshot.
+Plain text, one line, at most 72 characters.
+Match the style of the recent commits. Say why the change exists.
+No quotes and no conventional-commit prefix unless the recent commits use one."""
 
 ASK_SYSTEM = """Write one specific question for the user.
 Plain text, no preamble. Ask only for a fact you need in order to continue."""
@@ -47,6 +53,7 @@ class View:
     workspace: str
     tree: str
     project_instructions: str
+    snapshot: str = ""
     files_changed: list[str] = field(default_factory=list)
     loaded: dict[str, str] = field(default_factory=dict)
     observations: list[Observation] = field(default_factory=list)
@@ -93,6 +100,8 @@ def jev_state(view: View) -> dict:
         "files_loaded": list(view.loaded.keys()),
         "recent_actions": recent,
     }
+    if view.snapshot:
+        state["workspace_snapshot"] = clip(view.snapshot, 4000)
     if view.project_instructions:
         state["project_instructions"] = clip(view.project_instructions, 4000)
     if view.guidance:
@@ -113,6 +122,8 @@ def llm_user_message(view: View, tool_name: str, arg_help: str) -> str:
         f"Workspace: {view.workspace}",
         f"Tree:\n{clip(view.tree, 8000)}",
     ]
+    if view.snapshot:
+        sections.append("Workspace snapshot:\n" + clip(view.snapshot, 16_000))
     if view.project_instructions:
         sections.append("Project instructions:\n" + clip(view.project_instructions, 4000))
     if view.files_changed:
