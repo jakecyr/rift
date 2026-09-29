@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -164,6 +165,13 @@ class FakeDecisions:
 class BlockingDecisions(FakeDecisions):
     def gate(self, state) -> GateDecision:
         return GateDecision("block", 0.9, 0.8)
+
+
+class AnsweredDecisions(FakeDecisions):
+    """A question, or a goal the workspace already satisfies, needs no new file changes."""
+
+    def completion(self, state) -> CompletionDecision:
+        return CompletionDecision(0.95, 0.1)
 
 
 class UnprovenDecisions(FakeDecisions):
@@ -457,6 +465,16 @@ class InstructionTests(unittest.TestCase):
         self.assertNotIn("write_file", menu)
         self.assertIn("read_file", menu)
         self.assertIn("done", menu)
+
+    def test_a_green_test_run_counts_for_every_writing_tool(self) -> None:
+        for tool in ("edit_file", "write_file", "edit_batch", "replace_text"):
+            with self.subTest(tool=tool):
+                view = View(goal="rename", constraints=[], workspace=".", tree="", project_instructions="")
+                view.observations = [
+                    Observation(tool, "", f"{tool} changed 2 files", "diff", True),
+                    Observation("shell", "python3 -m unittest", "exit 0", "OK", True),
+                ]
+                self.assertTrue(latest_test_passed(view))
 
     def test_a_green_test_run_after_an_edit_counts(self) -> None:
         view = View(goal="fix tests", constraints=[], workspace=".", tree="", project_instructions="")
@@ -1015,6 +1033,294 @@ class OpenAITextTests(unittest.TestCase):
                 }
             )
         self.assertEqual(str(raised.exception), "model returned no text")
+
+
+class ActionCoverageTests(unittest.TestCase):
+    """One test per kind of request a user types, run end to end against a test project."""
+
+    def test_commit_and_push(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, remote = _project(Path(raw), with_remote=True)
+            (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            llm = ToolReplyLLM(
+                {
+                    "shell": [
+                        json.dumps({"command": "git add calc.py"}),
+                        json.dumps({"command": "git commit -m 'Add calc'"}),
+                        json.dumps({"command": "git push origin HEAD"}),
+                    ]
+                },
+                summary="Committed and pushed calc.py.",
+                plan=_plan("Commit calc.py and push it", ["git add calc.py", "git commit", "git push"], "origin has the commit"),
+            )
+            ui = ApprovingUI()
+            agent = Agent(Workspace(root), FakeDecisions(["shell", "shell", "shell", "done"]), llm, ui, settings(root, max_steps=5))
+            with patch.dict(os.environ, _GIT_ENV):
+                summary = agent.run_task("commit and push")
+            self.assertEqual(summary, "Committed and pushed calc.py.")
+            self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "Add calc")
+            self.assertEqual(_git(remote, ["log", "-1", "--format=%s"]), "Add calc")
+            confirms = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "confirm"]
+            self.assertEqual(len(confirms), 1)
+            self.assertIn("git push origin HEAD", confirms[0])
+
+    def test_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "notes.txt").write_text("notes\n", encoding="utf-8")
+            llm = ToolReplyLLM(
+                {"shell": [json.dumps({"command": "git add notes.txt"})]},
+                summary="Staged notes.txt.",
+                plan=_plan("Stage notes.txt", ["git add notes.txt"], "git diff --cached lists notes.txt"),
+            )
+            agent = Agent(Workspace(root), FakeDecisions(["shell", "done"]), llm, FakeUI(), settings(root))
+            summary = agent.run_task("stage")
+            self.assertEqual(summary, "Staged notes.txt.")
+            self.assertEqual(_git(root, ["diff", "--cached", "--name-only"]), "notes.txt")
+            self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "init")
+
+    def test_update_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            llm = ToolReplyLLM(
+                {
+                    "read_file": [json.dumps({"path": "calc.py"})],
+                    "edit_file": [
+                        json.dumps(
+                            {
+                                "path": "calc.py",
+                                "old_string": "    return a + b",
+                                "new_string": "    return int(a) + int(b)",
+                            }
+                        )
+                    ],
+                },
+                summary="Coerced the arguments in calc.py.",
+                plan=_plan("Coerce the arguments in add", ["read calc.py", "edit calc.py"], "calc.py calls int()"),
+            )
+            ui = FakeUI()
+            agent = Agent(Workspace(root), FakeDecisions(["read_file", "edit_file", "done"]), llm, ui, settings(root))
+            summary = agent.run_task("update calc.py so add coerces its arguments to int")
+            self.assertEqual(summary, "Coerced the arguments in calc.py.")
+            self.assertIn("int(a) + int(b)", (root / "calc.py").read_text(encoding="utf-8"))
+            self.assertEqual(("stats", ["calc.py"]), next(e for e in ui.events if isinstance(e, tuple) and e[0] == "stats"))
+
+    def test_replace_all_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "app.py").write_text("print('alpha')\n", encoding="utf-8")
+            (root / "docs").mkdir()
+            (root / "docs" / "alpha.md").write_text("see alpha\n", encoding="utf-8")
+            llm = ToolReplyLLM(
+                {"replace_text": [json.dumps({"old": "alpha", "new": "beta"})]},
+                summary="Renamed alpha to beta.",
+                plan=_plan("Replace alpha with beta everywhere", ["replace_text alpha -> beta"], "no file mentions alpha"),
+            )
+            agent = Agent(Workspace(root), FakeDecisions(["replace_text", "done"]), llm, FakeUI(), settings(root))
+            summary = agent.run_task("replace all instances of alpha with beta")
+            self.assertEqual(summary, "Renamed alpha to beta.")
+            self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "print('beta')\n")
+            self.assertTrue((root / "docs" / "beta.md").is_file())
+            self.assertFalse((root / "docs" / "alpha.md").exists())
+
+    def test_bang_git_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "README.md").write_text("hello\nshipped\n", encoding="utf-8")
+            buf = StringIO()
+            ui = UI(console=Console(file=buf, force_terminal=False, width=80))
+            agent = SimpleNamespace(prior=[], workspace=Workspace(root))
+            app = App(settings(root), agent, ui, None)
+            run_bang(app, "! git diff")
+            self.assertIn("+shipped", buf.getvalue())
+            self.assertEqual(len(agent.prior), 1)
+            self.assertIn("User ran `git diff`", agent.prior[0])
+            self.assertIn("+shipped", agent.prior[0])
+            self.assertEqual(_git(root, ["status", "--porcelain"]), "M README.md")
+
+    def test_add_tests_for_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            test_body = (
+                "import unittest\n\nfrom calc import add\n\n\n"
+                "class AddTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+            )
+            llm = ToolReplyLLM(
+                {
+                    "read_file": [json.dumps({"path": "calc.py"})],
+                    "write_file": [json.dumps({"path": "test_calc.py", "content": test_body})],
+                    "shell": [json.dumps({"command": "python3 -m unittest test_calc -v"})],
+                },
+                summary="Added test_calc.py and the suite passes.",
+                plan=_plan(
+                    "Add a unittest for calc.py",
+                    ["read calc.py", "write test_calc.py", "run python3 -m unittest test_calc"],
+                    "the test command exits 0",
+                ),
+            )
+            agent = Agent(
+                Workspace(root),
+                FakeDecisions(["read_file", "write_file", "shell", "done"]),
+                llm,
+                FakeUI(),
+                settings(root, max_steps=5),
+            )
+            summary = agent.run_task("add tests for calc.py")
+            self.assertEqual(summary, "Added test_calc.py and the suite passes.")
+            self.assertIn("assertEqual(add(1, 2), 3)", (root / "test_calc.py").read_text(encoding="utf-8"))
+            ran = [item for item in agent.last_view.observations if item.tool == "shell"]
+            self.assertTrue(ran[-1].ok)
+            self.assertIn("OK", ran[-1].detail)
+
+    def test_run_all_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "test_ok.py").write_text(
+                "import unittest\n\n\nclass OkTest(unittest.TestCase):\n"
+                "    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            llm = ToolReplyLLM(
+                {"shell": [json.dumps({"command": "python3 -m unittest discover -p 'test_*.py'"})]},
+                summary="The suite passes.",
+                plan=_plan("Run the test suite", ["python3 -m unittest discover"], "the command exits 0"),
+            )
+            ui = FakeUI()
+            agent = Agent(Workspace(root), FakeDecisions(["shell", "done"]), llm, ui, settings(root))
+            summary = agent.run_task("run all tests")
+            self.assertEqual(summary, "The suite passes.")
+            tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
+            self.assertEqual(tools, ["shell"])
+            self.assertTrue(agent.last_view.observations[-1].ok)
+            self.assertEqual(agent.last_view.files_changed, [])
+
+    def test_create_a_new_node_project(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            package = json.dumps(
+                {"name": "demo", "version": "1.0.0", "main": "index.js", "scripts": {"start": "node index.js"}},
+                indent=2,
+            )
+            llm = ToolReplyLLM(
+                {
+                    "write_file": [
+                        json.dumps({"path": "package.json", "content": package + "\n"}),
+                        json.dumps({"path": "index.js", "content": "console.log('demo');\n"}),
+                    ],
+                    "shell": [json.dumps({"command": "node index.js"})],
+                },
+                summary="Created package.json and index.js.",
+                plan=_plan(
+                    "Create a minimal node project",
+                    ["write package.json", "write index.js", "run node index.js"],
+                    "node index.js prints demo",
+                ),
+            )
+            agent = Agent(
+                Workspace(root),
+                FakeDecisions(["write_file", "write_file", "shell", "done"]),
+                llm,
+                FakeUI(),
+                settings(root, max_steps=5),
+            )
+            summary = agent.run_task("create a new node project")
+            self.assertEqual(summary, "Created package.json and index.js.")
+            self.assertEqual(json.loads((root / "package.json").read_text(encoding="utf-8"))["main"], "index.js")
+            self.assertIn("console.log", (root / "index.js").read_text(encoding="utf-8"))
+            self.assertEqual(agent.last_view.files_changed, ["package.json", "index.js"])
+            ran = agent.last_view.observations[-1]
+            self.assertEqual(ran.tool, "shell")
+            if shutil.which("node"):
+                self.assertTrue(ran.ok)
+                self.assertIn("demo", ran.detail)
+
+    def test_a_refusal_points_the_loop_at_done(self) -> None:
+        """The work already landed, so the writer has no edit to make. That is not a dead end."""
+        refusal = json.dumps(
+            {"need": "ask_user", "path": "", "reason": "the rename already happened; there is no edit to make"}
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            (root / "calc.py").write_text("def multiply(a, b):\n    return a * b\n", encoding="utf-8")
+            llm = ToolReplyLLM(
+                {"edit_batch": [refusal]},
+                summary="The rename was already complete.",
+                plan=_plan("Rename mul to multiply", ["replace mul with multiply"], "no file mentions mul"),
+            )
+            decisions = AnsweredDecisions(["edit_batch", "done"])
+            ui = FakeUI()
+            agent = Agent(Workspace(root), decisions, llm, ui, settings(root))
+            summary = agent.run_task("replace all instances of mul with multiply")
+            self.assertEqual(summary, "The rename was already complete.")
+            guidance = decisions.states[-1]["guidance"]
+            self.assertIn("could not fill edit_batch", guidance)
+            self.assertIn("Do not pick edit_batch again", guidance)
+            self.assertIn("pick done", guidance)
+            self.assertNotIn("repeated the same action", summary)
+
+    def test_a_repeat_is_told_to_check_the_result(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            llm = FakeLLM(
+                json.dumps({"path": "README.md"}),
+                summary="Read the readme.",
+                plan=_plan("Read README.md", ["read README.md"], "the file is loaded"),
+            )
+            decisions = AnsweredDecisions(["read_file", "read_file", "done"])
+            agent = Agent(Workspace(root), decisions, llm, FakeUI(), settings(root))
+            summary = agent.run_task("show me the readme")
+            self.assertEqual(summary, "Read the readme.")
+            guidance = decisions.states[-1]["guidance"]
+            self.assertIn("already ran", guidance)
+            self.assertIn("pick done", guidance)
+
+    def test_every_request_is_planned_before_a_tool_runs(self) -> None:
+        requests = ["commit and push", "stage", "replace all instances of x with y", "run all tests"]
+        with tempfile.TemporaryDirectory() as raw:
+            root, _remote = _project(Path(raw))
+            for request in requests:
+                with self.subTest(request=request):
+                    llm = FakeLLM(
+                        json.dumps({"command": "git status --porcelain"}),
+                        summary="Reported the status.",
+                        plan=_plan(request, ["git status"], "the command exits 0"),
+                    )
+                    decisions = FakeDecisions(["shell", "done"])
+                    agent = Agent(Workspace(root), decisions, llm, FakeUI(), settings(root))
+                    agent.run_task(request)
+                    self.assertEqual(len(llm.plan_users), 1)
+                    self.assertIn(f"User request:\n{request}", llm.plan_users[0])
+                    self.assertEqual(decisions.states[0]["plan"], ["git status"])
+                    self.assertEqual(decisions.states[0]["goal"], request)
+
+
+class ApprovingUI(FakeUI):
+    def confirm(self, message: str, forced: bool) -> bool:
+        self.events.append(("confirm", message))
+        return True
+
+
+def _plan(task: str, steps: list[str], done_when: str) -> str:
+    return json.dumps({"task": task, "steps": steps, "done_when": done_when})
+
+
+def _project(tmp: Path, with_remote: bool = False) -> tuple[Path, Path]:
+    """A git repo with one commit, and optionally a bare remote it can push to."""
+    root = tmp / "work"
+    root.mkdir()
+    _git_init(root)
+    remote = tmp / "remote.git"
+    if with_remote:
+        env = os.environ.copy()
+        env.update(_GIT_ENV)
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, env=env)
+        _git(root, ["remote", "add", "origin", str(remote)])
+        _git(root, ["push", "-u", "origin", "HEAD"])
+    return root, remote
 
 
 _GIT_ENV = {

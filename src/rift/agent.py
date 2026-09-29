@@ -144,6 +144,11 @@ class Agent:
                                 False,
                             )
                         )
+                        view.guidance = (
+                            f"{action.name} with those arguments already ran. "
+                            "Check recent_actions for its result. "
+                            "If done_when already holds, pick done. Otherwise pick a different action."
+                        )
                         self.ui.trace("skipped a repeated action")
                         if seen[signature] >= 4:
                             summary = self._stop("repeated the same action", view)
@@ -151,6 +156,11 @@ class Agent:
                         continue
                 if refusal is not None:
                     view.observations.append(refusal)
+                    view.guidance = (
+                        f"The writer could not fill {action.name}: {clip(refusal.detail, 400)} "
+                        f"Do not pick {action.name} again for this step. "
+                        "If done_when already holds, pick done. Otherwise pick a different tool."
+                    )
                     self.ui.info(f"        {refusal.summary}: {clip(refusal.detail, 200)}")
                     continue
                 assert args is not None
@@ -586,11 +596,14 @@ def _ran_a_command(view: View) -> bool:
 
 
 def latest_test_passed(view: View) -> bool:
-    """A green test run after the last edit is proof the model does not have to supply."""
+    """A green test run after the last change is proof the model does not have to supply.
+
+    Every tool that writes counts, not only the single-file ones.
+    """
     saw_edit = False
     passed = False
     for item in view.observations:
-        if item.tool in {"edit_file", "write_file"} and item.ok:
+        if item.tool in MUTATING - {"shell"} and item.ok:
             saw_edit = True
             passed = False
         if item.tool == "shell" and _is_test_command(f"{item.args_preview} {item.summary}"):
