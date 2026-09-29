@@ -1,0 +1,142 @@
+"""State sent to Jev, and the longer prompt sent to the writer model."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+
+from jevcode.util import clip
+
+BASE_CONSTRAINTS = [
+    "Stay inside the workspace.",
+    "Do not treat the task as finished until the files or the answer exist.",
+    "Prefer edit_file over write_file when the file already exists.",
+    "Use shell to run tests and builds, not to read files.",
+    "Run Python with python3. The command python may be an older interpreter.",
+    "Copy old_string from loaded file text. Do not invent surrounding code.",
+]
+
+ARG_SYSTEM = """You fill JSON arguments for one tool that was already chosen.
+Return one JSON object and no other text.
+Do not choose a different tool.
+old_string must be copied exactly from the loaded file text, including whitespace.
+If the loaded text is missing or truncated so you cannot copy an exact snippet, return {"need":"read_file","path":"the/file","reason":"why"}.
+If the tool cannot be filled, return {"need":"ask_user","path":"","reason":"why"}."""
+
+SUMMARY_SYSTEM = """Write a short completion note for the user.
+Plain text, no JSON. Say what changed, which files, and anything left unfinished.
+Stay under 150 words."""
+
+ASK_SYSTEM = """Write one specific question for the user.
+Plain text, no preamble. Ask only for a fact you need in order to continue."""
+
+
+@dataclass
+class Observation:
+    tool: str
+    args_preview: str
+    summary: str
+    detail: str
+    ok: bool
+
+
+@dataclass
+class View:
+    goal: str
+    constraints: list[str]
+    workspace: str
+    tree: str
+    project_instructions: str
+    files_changed: list[str] = field(default_factory=list)
+    loaded: dict[str, str] = field(default_factory=dict)
+    observations: list[Observation] = field(default_factory=list)
+    guidance: str = ""
+    prior_tasks: list[str] = field(default_factory=list)
+
+    def remember_file(self, path: str, content: str) -> None:
+        self.loaded.pop(path, None)
+        self.loaded[path] = content[:120_000]
+        while len(self.loaded) > 6:
+            oldest = next(iter(self.loaded))
+            del self.loaded[oldest]
+
+
+def jev_state(view: View) -> dict:
+    recent = []
+    for item in view.observations[-8:]:
+        entry = {
+            "tool": item.tool,
+            "ok": item.ok,
+            "args": clip(item.args_preview, 240),
+            "summary": clip(item.summary, 400),
+        }
+        if item.detail and item.tool in {"read_file", "grep", "edit_file", "write_file", "shell"}:
+            entry["evidence"] = clip(item.detail, 700)
+        recent.append(entry)
+    state = {
+        "goal": view.goal,
+        "constraints": view.constraints,
+        "workspace": view.workspace,
+        "tree": clip(view.tree, 8000),
+        "files_changed": view.files_changed[-20:],
+        "files_loaded": list(view.loaded.keys()),
+        "recent_actions": recent,
+    }
+    if view.project_instructions:
+        state["project_instructions"] = clip(view.project_instructions, 4000)
+    if view.guidance:
+        state["guidance"] = view.guidance
+    if view.prior_tasks:
+        state["prior_tasks"] = view.prior_tasks[-4:]
+    return state
+
+
+def llm_user_message(view: View, tool_name: str, arg_help: str) -> str:
+    sections = [
+        f"Selected tool: {tool_name}",
+        f"Argument shape: {arg_help}",
+        f"Goal:\n{view.goal}",
+        "Constraints:\n" + "\n".join(f"- {item}" for item in view.constraints),
+        f"Workspace: {view.workspace}",
+        f"Tree:\n{clip(view.tree, 8000)}",
+    ]
+    if view.project_instructions:
+        sections.append("Project instructions:\n" + clip(view.project_instructions, 4000))
+    if view.files_changed:
+        sections.append("Files changed this task:\n" + "\n".join(view.files_changed))
+    if view.guidance:
+        sections.append("Guidance:\n" + view.guidance)
+    if view.prior_tasks:
+        sections.append("Earlier tasks:\n" + "\n".join(view.prior_tasks[-4:]))
+    if view.loaded:
+        sections.append("Loaded files (exact text you may copy):\n" + _loaded_block(view))
+    if view.observations:
+        sections.append("Recent actions:\n" + _observation_block(view))
+    return clip("\n\n".join(sections), 80_000)
+
+
+def state_is_large(state: dict) -> bool:
+    return len(json.dumps(state, default=str)) > 40_000
+
+
+def _loaded_block(view: View) -> str:
+    blocks: list[str] = []
+    budget = 48_000
+    for path, content in reversed(list(view.loaded.items())):
+        header = f"--- {path} ({len(content)} chars) ---"
+        room = budget - len(header) - 2
+        if room < 500:
+            break
+        body = content if len(content) <= room else content[:room] + "\n...[file truncated, read a narrower offset]"
+        blocks.append(f"{header}\n{body}")
+        budget -= len(blocks[-1])
+    return "\n\n".join(reversed(blocks))
+
+
+def _observation_block(view: View) -> str:
+    lines: list[str] = []
+    for item in view.observations[-6:]:
+        lines.append(f"- {item.tool} ok={item.ok} {clip(item.summary, 300)}")
+        if item.detail and item.tool in {"shell", "grep", "edit_file", "write_file", "ask_user"}:
+            lines.append(clip(item.detail, 2500))
+    return "\n".join(lines)
