@@ -1,4 +1,4 @@
-from jevcode.cli import main
+from rift.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

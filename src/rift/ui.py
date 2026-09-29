@@ -12,7 +12,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from jevcode.llm import UsageMeter
+from rift.llm import UsageMeter
 
 
 class UI:
@@ -40,7 +40,7 @@ class UI:
         self.console.print(
             Panel(
                 grid,
-                title="[bold]jevcode[/]",
+                title="[bold]rift[/]",
                 subtitle="[dim]/help[/]",
                 border_style="cyan",
                 padding=(1, 2),
@@ -93,7 +93,11 @@ class UI:
         self.console.print(Panel(grid, title="doctor", border_style="cyan", padding=(1, 2)))
 
     def status(self, text: str) -> None:
-        self.console.print(f"  [dim]{escape(text.strip())}[/]")
+        self.trace(text)
+
+    def trace(self, text: str) -> None:
+        if self.verbose and text.strip():
+            self.console.print(f"  [dim]{escape(text.strip())}[/]")
 
     def decision(
         self,
@@ -104,36 +108,92 @@ class UI:
         probabilities: dict,
         request_id: str,
     ) -> None:
-        self.console.print(
-            f"\n[bold cyan]step {step}[/]  [bold]{escape(name)}[/]  "
-            f"[dim]{confidence:.2f}  {escape(tier)}[/]"
-        )
-        if self.verbose and probabilities:
-            ranked = "  ".join(
-                f"{escape(key)} [dim]{value:.2f}[/]"
-                for key, value in sorted(probabilities.items(), key=lambda item: -item[1])
+        if self.verbose:
+            self.console.print(
+                f"\n[bold cyan]step {step}[/]  [bold]{escape(name)}[/]  "
+                f"[dim]{confidence:.2f}  {escape(tier)}[/]"
             )
-            extra = f"  [dim]{escape(request_id)}[/]" if request_id else ""
-            self.console.print(f"  {ranked}{extra}")
+            if probabilities:
+                ranked = "  ".join(
+                    f"{escape(key)} [dim]{value:.2f}[/]"
+                    for key, value in sorted(probabilities.items(), key=lambda item: -item[1])
+                )
+                extra = f"  [dim]{escape(request_id)}[/]" if request_id else ""
+                self.console.print(f"  {ranked}{extra}")
+            return
+        if name == "done":
+            return
+        self.console.print(f"\n[bold]{escape(_label(name))}[/]", highlight=False)
 
     def gate(self, action: str, destructive: float, reason: str) -> None:
+        if action == "allow" and not self.verbose:
+            return
         color = {"allow": "green", "confirm": "yellow", "block": "red"}.get(action, "white")
         tail = f"  {escape(reason)}" if reason else ""
-        self.console.print(f"  [{color}]gate {escape(action)}[/]  [dim]destructive {destructive:.2f}[/]{tail}")
+        score = f"  [dim]destructive {destructive:.2f}[/]" if self.verbose else ""
+        self.console.print(f"  [{color}]{escape(action)}[/]{score}{tail}")
 
     def rule(self, level: str, reason: str) -> None:
+        if level == "allow" and not self.verbose:
+            return
         color = {"allow": "green", "confirm": "yellow", "block": "red"}.get(level, "white")
-        self.console.print(f"  [{color}]rule {escape(level)}[/]  {escape(reason)}")
+        self.console.print(f"  [{color}]{escape(level)}[/]  {escape(reason)}")
 
-    def tool(self, name: str, summary: str, detail: str) -> None:
-        self.console.print(f"  [dim]{escape(name)}[/]  {escape(summary)}")
-        if not detail or name not in {"shell", "grep", "edit_file", "write_file", "glob"}:
+    def tool(self, name: str, summary: str, detail: str, paths: tuple[str, ...] = ()) -> None:
+        if name in {"replace_text", "edit_batch"} and paths:
+            self._file_list(paths)
             return
-        preview = "\n".join(detail.splitlines()[:40])
-        if _looks_like_diff(preview):
-            self.console.print(Syntax(preview, "diff", theme="monokai", word_wrap=True, padding=1))
+        if name in {"edit_file", "write_file"}:
+            self.console.print(f"  {escape(_short_summary(summary))}", highlight=False)
+            self._diff(detail, 18 if self.verbose else 10)
             return
+        if name == "grep":
+            self.console.print(f"  {escape(summary)}", highlight=False)
+            if self.verbose:
+                self._body(detail, 24)
+            return
+        if name == "shell":
+            self.console.print(f"  {escape(summary)}", highlight=False)
+            failed = not summary.startswith("exit 0")
+            if self.verbose or failed:
+                self._body(detail, 24 if self.verbose else 12)
+            return
+        if name in {"web_search", "web_fetch", "think", "todo", "delete_file"}:
+            self.console.print(f"  {escape(summary)}", highlight=False)
+            if detail.strip() and detail.strip() != summary.strip():
+                self._body(detail, 16 if self.verbose else 6)
+            return
+        if name == "read_file":
+            self.console.print(f"  [dim]{escape(summary)}[/]", highlight=False)
+            return
+        if summary:
+            self.console.print(f"  {escape(summary)}", highlight=False)
+
+    def _file_list(self, paths: tuple[str, ...]) -> None:
+        shown = list(paths)[:8]
+        for path in shown:
+            self.console.print(f"  [dim]{escape(path)}[/]", highlight=False)
+        extra = len(paths) - len(shown)
+        if extra:
+            self.console.print(f"  [dim]+{extra} more[/]")
+
+    def _diff(self, detail: str, limit: int) -> None:
+        if not detail or not _looks_like_diff(detail):
+            return
+        lines = detail.splitlines()
+        preview = "\n".join(lines[:limit])
+        self.console.print(Syntax(preview, "diff", theme="monokai", word_wrap=True, padding=(0, 1)))
+        if len(lines) > limit:
+            self.console.print(f"  [dim]+{len(lines) - limit} lines[/]")
+
+    def _body(self, detail: str, limit: int) -> None:
+        if not detail:
+            return
+        lines = detail.splitlines()
+        preview = "\n".join(lines[:limit])
         self.console.print(Text(preview, style="dim"))
+        if len(lines) > limit:
+            self.console.print(f"  [dim]+{len(lines) - limit} lines[/]")
 
     def info(self, text: str) -> None:
         self.console.print(f"  {escape(text)}")
@@ -175,20 +235,41 @@ class UI:
 
     def stats(self, meter: UsageMeter, files: list[str]) -> None:
         cost = meter.jev_input_tokens / 1_000_000 * 0.042
-        self.console.print(
-            "  [dim]"
-            f"jev {meter.jev_calls} calls · {meter.jev_input_tokens} tokens · ~${cost:.4f}"
-            f"    writer {meter.llm_calls} calls · {meter.llm_input_tokens} in / {meter.llm_output_tokens} out"
-            "[/]"
-        )
+        parts = [f"jev {meter.jev_calls}", f"writer {meter.llm_calls}"]
         if files:
-            self.console.print("  [dim]files[/]  " + escape(", ".join(files)))
+            parts.append(f"{len(files)} files")
+        if meter.jev_calls:
+            parts.append(f"~${cost:.4f}")
+        self.console.print("\n[dim]" + "  ·  ".join(parts) + "[/]", highlight=False)
 
     def clear(self) -> None:
         self.console.clear()
 
     def say(self, text: str) -> None:
         self.console.print(text, highlight=False)
+
+
+def _label(name: str) -> str:
+    return {
+        "read_file": "read",
+        "edit_file": "edit",
+        "edit_batch": "edit",
+        "write_file": "write",
+        "delete_file": "delete",
+        "replace_text": "replace",
+        "list_dir": "list",
+        "web_search": "web search",
+        "web_fetch": "fetch",
+        "think": "think",
+        "todo": "todo",
+    }.get(name, name)
+
+
+def _short_summary(summary: str) -> str:
+    for prefix in ("edited ", "wrote "):
+        if summary.startswith(prefix):
+            return summary[len(prefix) :]
+    return summary
 
 
 def short_path(path: Path | str) -> str:

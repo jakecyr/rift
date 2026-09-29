@@ -1,4 +1,4 @@
-# jevcode
+# rift
 
 A coding agent for the repo in front of you. A frontier model writes. [Jev](https://typesafe.ai) decides. Hard rules stay in Python.
 
@@ -18,7 +18,7 @@ Put the virtualenv on your `PATH` once, then start it from any project:
 ```bash
 export PATH="$HOME/code/my-assistant/.venv/bin:$PATH"
 cd ~/some/other/project
-jevcode
+rift
 ```
 
 ## Keys
@@ -27,9 +27,9 @@ Files are read first, then the process environment wins. A command the agent run
 
 From lowest priority to highest:
 
-1. The `.env` next to this jevcode checkout. An editable install still finds it when you start `jevcode` from another folder.
+1. The `.env` next to this rift checkout. An editable install still finds it when you start `rift` from another folder.
 2. `.env` in the folder you launched from, when that file is a different path.
-3. `~/.jevcode/.env`, which is where `/key` saves a key.
+3. `~/.rift/.env`, which is where `/key` saves a key.
 4. The process environment.
 
 ```bash
@@ -41,19 +41,19 @@ OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
 ```bash
-jevcode --doctor
+rift --doctor
 ```
 
 ## Use it
 
-`/model` and `--model` pick the writer. `/provider` (or `/backend`) switches OpenAI, Anthropic, Grok, or Ollama. Those choices are saved in `~/.jevcode/config.json`.
+`/model` and `--model` pick the writer. `/provider` (or `/backend`) switches OpenAI, Anthropic, Grok, or Ollama. Those choices are saved in `~/.rift/config.json`.
 
 ```bash
-jevcode
-jevcode --model gpt-4.1-mini "Fix the failing test"
-jevcode --provider anthropic "Add retry logic to src/http.py"
-jevcode --provider ollama --model qwen2.5-coder "Explain this repository"
-jevcode --fast-model gpt-4.1-mini "Rename the helper and update callers"
+rift
+rift --model gpt-4.1-mini "Fix the failing test"
+rift --provider anthropic "Add retry logic to src/http.py"
+rift --provider ollama --model qwen2.5-coder "Explain this repository"
+rift --fast-model gpt-4.1-mini "Rename the helper and update callers"
 ```
 
 Inside the prompt: `/model`, `/provider`, `/fast`, `/key`, `/cd`, `/clear`, `/doctor`, `/help`, `/quit`. Up-arrow recalls history. Tab completes commands. `test` runs the project's test command instead of opening test files.
@@ -70,5 +70,7 @@ Inside the prompt: `/model`, `/provider`, `/fast`, `/key`, `/cd`, `/clear`, `/do
 4. Jev gates edits and shell calls (`allow`, `confirm`, `block`).
 5. The tool runs.
 6. Every few steps Jev scores progress. When it picks done, code checks that the files are really there.
+
+A repo-wide rename is one step. Several different edits go out together in one step.
 
 Defaults are `gpt-6-astra`, `claude-sonnet-5-5`, `grok-4`, and `qwen2.5-coder`. Override them with `--model` or `/model`.

@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from jevcode import __version__
+from rift import __version__
 
 PROVIDERS = ("openai", "anthropic", "grok", "ollama")
 DEFAULT_MODELS = {
@@ -49,7 +49,7 @@ class Settings:
 
 def main_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="jevcode",
+        prog="rift",
         description=(
             "Agentic coding CLI. A frontier model writes code. "
             "Jev chooses the next action, gates risky calls, and checks completion. "
@@ -57,12 +57,12 @@ def main_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  jevcode
-  jevcode --provider anthropic "Add retry logic to src/http.py"
-  jevcode --model gpt-4.1-mini "Fix the failing test"
-  jevcode --provider ollama --model qwen2.5-coder "Explain this repository"
-  jevcode --fast-model gpt-4.1-mini "Rename the helper and update callers"
-  jevcode --doctor
+  rift
+  rift --provider anthropic "Add retry logic to src/http.py"
+  rift --model gpt-4.1-mini "Fix the failing test"
+  rift --provider ollama --model qwen2.5-coder "Explain this repository"
+  rift --fast-model gpt-4.1-mini "Rename the helper and update callers"
+  rift --doctor
 """
     )
     parser.add_argument("task", nargs="*", help="Task to run. Omit it to open the REPL.")
@@ -82,7 +82,7 @@ def main_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-outside", action="store_true", help="Permit paths outside the workspace.")
     parser.add_argument("--verbose", action="store_true", help="Print Jev probabilities and request ids.")
     parser.add_argument("--doctor", action="store_true", help="Show which keys and models are configured.")
-    parser.add_argument("--version", action="version", version=f"jevcode {__version__}")
+    parser.add_argument("--version", action="version", version=f"rift {__version__}")
     return parser
 
 
@@ -254,7 +254,7 @@ def print_doctor(settings: Settings) -> None:
 
 
 def user_config_dir() -> Path:
-    return Path.home() / ".jevcode"
+    return Path.home() / ".rift"
 
 
 def user_env_path() -> Path:
@@ -267,6 +267,10 @@ def prefs_path() -> Path:
 
 def load_prefs(path: Path | None = None) -> dict:
     file = path or prefs_path()
+    if not file.is_file() and path is None:
+        legacy = Path.home() / ".jevcode" / "config.json"
+        if legacy.is_file():
+            file = legacy
     if not file.is_file():
         return {}
     try:
@@ -326,13 +330,17 @@ def choose_model(
 
 
 def env_file_candidates(cwd: Path, project_env: Path | None, home_env: Path) -> list[Path]:
-    """Later files override earlier ones. Keys saved in ~/.jevcode win over the repo file."""
+    """Later files override earlier ones. Keys saved in ~/.rift win over the repo file."""
     ordered: list[Path] = []
     if project_env is not None:
         ordered.append(project_env)
     cwd_env = cwd / ".env"
     if project_env is None or not _same_file(cwd_env, project_env):
         ordered.append(cwd_env)
+    if home_env == user_env_path():
+        legacy = Path.home() / ".jevcode" / ".env"
+        if legacy.is_file() and all(not _same_file(legacy, item) for item in ordered):
+            ordered.append(legacy)
     ordered.append(home_env)
     return ordered
 
@@ -348,23 +356,23 @@ def merge_env(files: list[Path], process: dict[str, str]) -> dict[str, str]:
 
 
 def find_project_env() -> Path | None:
-    """The .env next to this checkout, so keys work when jevcode is started elsewhere."""
+    """The .env next to this checkout, so keys work when rift is started elsewhere."""
     start = Path(__file__).resolve()
     for parent in start.parents:
         manifest = parent / "pyproject.toml"
-        if not manifest.is_file() or not _is_jevcode_project(manifest):
+        if not manifest.is_file() or not _is_rift_project(manifest):
             continue
         env_path = parent / ".env"
         return env_path if env_path.is_file() else None
     return None
 
 
-def _is_jevcode_project(manifest: Path) -> bool:
+def _is_rift_project(manifest: Path) -> bool:
     try:
         text = manifest.read_text(encoding="utf-8", errors="ignore")
     except OSError:
         return False
-    return 'name = "jevcode"' in text or "name = 'jevcode'" in text
+    return 'name = "rift"' in text or "name = 'rift'" in text
 
 
 def _same_file(left: Path, right: Path) -> bool:

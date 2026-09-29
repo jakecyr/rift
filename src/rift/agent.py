@@ -8,16 +8,16 @@ from __future__ import annotations
 
 import json
 
-from jevcode.decisions import (
+from rift.decisions import (
     ActionDecision,
     CompletionDecision,
     DecisionError,
     GateDecision,
 )
-from jevcode.llm import GenerationError
-from jevcode.prompt import argument_system
-from jevcode.safety import Verdict, allow, block, classify_path, classify_shell, confirm
-from jevcode.state import (
+from rift.llm import GenerationError
+from rift.prompt import argument_system
+from rift.safety import Verdict, allow, block, classify_path, classify_shell, confirm
+from rift.state import (
     ASK_SYSTEM,
     BASE_CONSTRAINTS,
     SUMMARY_SYSTEM,
@@ -27,10 +27,11 @@ from jevcode.state import (
     llm_user_message,
     state_is_large,
 )
-from jevcode.tools import SPECS, ToolError, ToolResult, Workspace, action_menu, project_instructions, unified_diff
-from jevcode.util import clip, extract_json
+from rift.tools import SPECS, ToolError, ToolResult, Workspace, action_menu, project_instructions, unified_diff
+from rift.util import clip, extract_json
+from rift.web import web_fetch, web_search
 
-MUTATING = {"edit_file", "write_file", "shell"}
+MUTATING = {"edit_file", "edit_batch", "replace_text", "write_file", "delete_file", "shell"}
 
 
 class Agent:
@@ -87,6 +88,14 @@ class Agent:
                         break
                     if action.name != "shell":
                         action = ActionDecision("shell", 0.95, {"shell": 0.95}, action.tier, action.request_id)
+                if wants_repo_replace(view.goal) and not _ran_replace(view):
+                    if self.settings.read_only:
+                        summary = self._stop("a repo-wide replace needs write access", view)
+                        break
+                    if action.name != "replace_text":
+                        action = ActionDecision(
+                            "replace_text", 0.95, {"replace_text": 0.95}, action.tier, action.request_id
+                        )
                 self.ui.decision(
                     step,
                     action.name,
@@ -110,13 +119,22 @@ class Agent:
                         summary = self._stop(view.observations[-1].detail or "stopped to ask the user", view)
                         break
                     continue
+                if action.name == "think" and view.observations and view.observations[-1].tool == "think":
+                    view.guidance = "A thought is already recorded. Choose a tool."
+                    view.observations.append(Observation("think", "", "skipped", view.guidance, False))
+                    self.ui.trace("skipped a second thought")
+                    continue
                 uncertain_edit = action.name in MUTATING and action.confidence < 0.6
-                if uncertain_edit and (action.confidence < 0.45 or not _spec_is_loaded(view)):
+                mechanical = action.name in {"edit_batch", "replace_text"} or wants_repo_replace(view.goal)
+                if (
+                    not mechanical
+                    and uncertain_edit
+                    and (action.confidence < 0.45 or not _spec_is_loaded(view))
+                ):
                     fallback = None if _spec_is_loaded(view) else fallback_action(action)
                     if fallback is not None:
-                        self.ui.info(
-                            f"        held {action.name} at {action.confidence:.2f}; "
-                            f"using {fallback.name} to get the missing evidence"
+                        self.ui.trace(
+                            f"held {action.name} at {action.confidence:.2f}; using {fallback.name}"
                         )
                         action = fallback
                     else:
@@ -128,7 +146,7 @@ class Agent:
                         view.observations.append(
                             Observation(action.name, "", "skipped", view.guidance, False)
                         )
-                        self.ui.info("        skipped a low-confidence change")
+                        self.ui.trace("skipped a low-confidence change")
                         self._held_edits += 1
                         if self._held_edits >= 4:
                             summary = self._stop("held an uncertain edit four times", view)
@@ -153,7 +171,7 @@ class Agent:
                                 False,
                             )
                         )
-                        self.ui.info("        skipped a repeated action")
+                        self.ui.trace("skipped a repeated action")
                         if seen[signature] >= 4:
                             summary = self._stop("repeated the same action", view)
                             break
@@ -165,13 +183,28 @@ class Agent:
                 view.observations.append(
                     Observation(action.name, clip(preview, 500), result.summary, result.detail, result.ok)
                 )
-                self.ui.tool(action.name, result.summary, result.detail)
-                if result.ok and action.name in {"edit_file", "write_file"}:
+                self.ui.tool(action.name, result.summary, result.detail, result.paths)
+                if result.ok and action.name == "think":
+                    view.guidance = result.detail
+                if result.ok and action.name == "todo":
+                    view.todos = list(args["todos"])
+                if result.ok and action.name == "delete_file":
                     rel = self._display(str(args.get("path", "")))
-                    if rel and rel not in files_changed:
-                        files_changed.append(rel)
+                    if rel:
+                        marker = f"deleted {rel}"
+                        if marker not in files_changed:
+                            files_changed.append(marker)
                     view.files_changed = list(files_changed)
-                    self._refresh_loaded(view, str(args.get("path", "")))
+                if result.ok and action.name in {"edit_file", "write_file", "edit_batch", "replace_text"}:
+                    paths = list(result.paths)
+                    if not paths and args.get("path"):
+                        paths = [self._display(str(args.get("path", "")))]
+                    for rel in paths:
+                        if rel and rel not in files_changed:
+                            files_changed.append(rel)
+                        if rel:
+                            self._refresh_loaded(view, rel)
+                    view.files_changed = list(files_changed)
                 if result.ok and action.name == "read_file":
                     rel = self._display(str(args.get("path", "")))
                     if rel:
@@ -216,11 +249,11 @@ class Agent:
             else:
                 passed = False
                 reason = "the test command has not exited 0"
-        self.ui.info(
-            f"        complete {verdict.complete:.2f}  needs_file_changes {verdict.needs_file_changes:.2f}"
+        self.ui.trace(
+            f"complete {verdict.complete:.2f}  needs_file_changes {verdict.needs_file_changes:.2f}"
         )
         if verdict.complete <= 0.8 and passed:
-            self.ui.info(f"        {reason}")
+            self.ui.trace(reason)
         if not passed:
             view.observations.append(Observation("done", "", "completion rejected", reason, False))
             self.ui.info(f"        rejected: {reason}")
@@ -246,7 +279,12 @@ class Agent:
                 "Set command to the test command in the project instructions when one is given. "
                 "Otherwise use the runner this repo already uses. Use python3, not python."
             )
-        max_tokens = 16384 if action.name in {"edit_file", "write_file"} else 2048
+        if action.name == "replace_text":
+            user += (
+                "\n\nSet old and new from the user message. "
+                "One call replaces the text in every file and in file names. Leave glob empty."
+            )
+        max_tokens = 16384 if action.name in {"edit_file", "write_file", "edit_batch"} else 2048
         self.ui.status(f"        writing arguments with {self._model_name(action.tier)}")
         result = self.llm.complete(action.tier, argument_system(view.project_instructions), user, max_tokens, 0.0)
         try:
@@ -324,8 +362,24 @@ class Agent:
                 return self.workspace.edit_file(
                     args["path"], args["old_string"], args["new_string"], args["replace_all"], True
                 )
+            if tool == "edit_batch":
+                return self.workspace.edit_batch(args["edits"], True)
+            if tool == "replace_text":
+                return self.workspace.replace_text(args["old"], args["new"], args["glob"], True)
             if tool == "write_file":
                 return self.workspace.write_file(args["path"], args["content"], True)
+            if tool == "delete_file":
+                return self.workspace.delete_file(args["path"], True)
+            if tool == "web_search":
+                return web_search(args["query"])
+            if tool == "web_fetch":
+                return web_fetch(args["url"])
+            if tool == "think":
+                thought = args["thought"]
+                return ToolResult(True, clip(thought, 200), thought)
+            if tool == "todo":
+                lines = [f"{item['status']}: {item['content']}" for item in args["todos"]]
+                return ToolResult(True, f"{len(lines)} tasks", "\n".join(lines))
             if tool == "shell":
                 return self.workspace.shell(args["command"], args["timeout_sec"], True)
         except ToolError as error:
@@ -344,10 +398,22 @@ class Agent:
             try:
                 path.relative_to(self.workspace.root)
             except ValueError:
-                if tool in {"edit_file", "write_file", "shell"}:
+                if tool in {"edit_file", "write_file", "delete_file", "shell"}:
                     return confirm("path is outside the workspace")
-        if tool in {"edit_file", "write_file"}:
+        if tool in {"edit_file", "write_file", "delete_file"}:
             return classify_path(path)
+        if tool == "edit_batch":
+            worst = allow()
+            for edit in args.get("edits") or []:
+                try:
+                    verdict = classify_path(self.workspace.resolve(str(edit.get("path", "."))))
+                except ToolError as error:
+                    return block(str(error))
+                if verdict.level == "block":
+                    return verdict
+                if verdict.level == "confirm":
+                    worst = verdict
+            return worst
         return allow()
 
     def _ask(self, view: View, tier: str) -> bool:
@@ -376,7 +442,7 @@ class Agent:
         except DecisionError as error:
             self.ui.error(str(error))
             return strikes
-        self.ui.info(f"        progress {verdict.progressing:.2f}  repeating {verdict.repeating:.2f}")
+        self.ui.trace(f"progress {verdict.progressing:.2f}  repeating {verdict.repeating:.2f}")
         if verdict.repeating > 0.7 or verdict.progressing < 0.3:
             view.guidance = (
                 "The last actions did not move the goal forward. "
@@ -417,6 +483,12 @@ class Agent:
             return f"        edit {args['path']}?\n{diff}"
         if tool == "write_file":
             return f"        write {args['path']} ({len(args['content'])} chars)?"
+        if tool == "replace_text":
+            return f"        replace {args.get('old', '')!r} with {args.get('new', '')!r} across the workspace?"
+        if tool == "edit_batch":
+            return f"        apply {len(args.get('edits') or [])} edits?"
+        if tool == "delete_file":
+            return f"        delete {args.get('path', '')}?"
         return f"        run {tool}?"
 
     def _refresh_loaded(self, view: View, raw: str) -> None:
@@ -482,6 +554,16 @@ def _ranked(probabilities: dict[str, float]) -> str:
     return ", ".join(f"{name}={prob:.2f}" for name, prob in ordered)
 
 
+def wants_repo_replace(goal: str) -> bool:
+    """The user asked to change one string everywhere, not to edit files one by one."""
+    text = " ".join(goal.strip().lower().split())
+    return "all instances" in text or "every instance" in text or "everywhere" in text
+
+
+def _ran_replace(view: View) -> bool:
+    return any(item.tool == "replace_text" for item in view.observations)
+
+
 def wants_test_run(goal: str) -> bool:
     """A bare request to run the suite, not a request to change tests."""
     text = " ".join(goal.strip().lower().strip(".!?").split())
@@ -540,6 +622,11 @@ def prove_completion(verdict: CompletionDecision, files_changed: list[str], work
     missing: list[str] = []
     empty: list[str] = []
     for rel in files_changed:
+        if rel.startswith("deleted "):
+            target = rel.removeprefix("deleted ")
+            if (workspace.root / target).exists():
+                missing.append(target + " still exists")
+            continue
         path = workspace.root / rel
         if not path.exists():
             missing.append(rel)
@@ -593,6 +680,33 @@ def normalize_args(tool: str, args: dict) -> tuple[dict | None, str]:
             "new_string": new,
             "replace_all": _bool(args.get("replace_all")),
         }, ""
+    if tool == "edit_batch":
+        edits = args.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return None, "edits must be a non-empty list"
+        if len(edits) > 40:
+            return None, "too many edits"
+        cleaned: list[dict] = []
+        for item in edits:
+            if not isinstance(item, dict):
+                return None, "each edit must be an object"
+            normalized, error = normalize_args("edit_file", item)
+            if error or normalized is None:
+                return None, error or "invalid edit"
+            cleaned.append(normalized)
+        return {"edits": cleaned}, ""
+    if tool == "replace_text":
+        old = args.get("old")
+        new = args.get("new")
+        if not isinstance(old, str) or old == "":
+            return None, "old must be a non-empty string"
+        if not isinstance(new, str):
+            return None, "new must be a string"
+        if old == new:
+            return None, "old and new are identical"
+        if len(old) > 10_000 or len(new) > 10_000:
+            return None, "replacement is too long"
+        return {"old": old, "new": new, "glob": _string(args.get("glob"))}, ""
     if tool == "write_file":
         path = _string(args.get("path"))
         content = args.get("content")
@@ -610,16 +724,72 @@ def normalize_args(tool: str, args: dict) -> tuple[dict | None, str]:
         if len(command) > 4000:
             return None, "command is too long"
         return {"command": command, "timeout_sec": _int(args.get("timeout_sec"), 120, 1, 300)}, ""
+    if tool == "delete_file":
+        path = _string(args.get("path"))
+        if not path:
+            return None, "path is required"
+        return {"path": path}, ""
+    if tool == "web_search":
+        query = _string(args.get("query"))
+        if not query:
+            return None, "query is required"
+        if len(query) > 400:
+            return None, "query is too long"
+        return {"query": query}, ""
+    if tool == "web_fetch":
+        url = _string(args.get("url"))
+        if not url:
+            return None, "url is required"
+        return {"url": url}, ""
+    if tool == "think":
+        thought = _string(args.get("thought"))
+        if not thought:
+            return None, "thought is required"
+        if len(thought) > 4000:
+            return None, "thought is too long"
+        return {"thought": thought}, ""
+    if tool == "todo":
+        items = args.get("todos")
+        if not isinstance(items, list) or not items:
+            return None, "todos must be a non-empty list"
+        if len(items) > 20:
+            return None, "too many todos"
+        cleaned: list[dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                return None, "each todo must be an object"
+            content = _string(item.get("content"))
+            status = _string(item.get("status")) or "pending"
+            if not content:
+                return None, "todo content is required"
+            if status not in {"pending", "in_progress", "completed"}:
+                return None, "status must be pending, in_progress, or completed"
+            cleaned.append({"content": content, "status": status})
+        return {"todos": cleaned}, ""
     return None, f"unknown tool {tool}"
 
 
 def _has_payload(tool: str, args: dict) -> bool:
     if tool == "edit_file":
         return isinstance(args.get("old_string"), str)
+    if tool == "edit_batch":
+        return isinstance(args.get("edits"), list)
+    if tool == "replace_text":
+        return isinstance(args.get("old"), str)
     if tool == "write_file":
         return isinstance(args.get("content"), str)
     if tool == "shell":
         return isinstance(args.get("command"), str)
+    if tool == "delete_file":
+        return isinstance(args.get("path"), str)
+    if tool == "web_search":
+        return isinstance(args.get("query"), str)
+    if tool == "web_fetch":
+        return isinstance(args.get("url"), str)
+    if tool == "think":
+        return isinstance(args.get("thought"), str)
+    if tool == "todo":
+        return isinstance(args.get("todos"), list)
     if tool in {"grep", "glob"}:
         return isinstance(args.get("pattern"), str)
     if tool in {"read_file", "list_dir"}:

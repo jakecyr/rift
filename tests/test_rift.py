@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from rich.console import Console
 
-from jevcode.agent import (
+from rift.agent import (
     Agent,
     fallback_action,
     latest_test_passed,
@@ -20,21 +20,22 @@ from jevcode.agent import (
     prove_completion,
     wants_test_run,
 )
-from jevcode.config import (
+from rift.config import (
     Settings,
     choose_model,
     env_file_candidates,
     find_project_env,
     merge_env,
 )
-from jevcode.decisions import ActionDecision, CompletionDecision, GateDecision, ProgressDecision
-from jevcode.llm import LLMResult, UsageMeter
-from jevcode.repl import App, handle_command
-from jevcode.safety import classify_path, classify_shell
-from jevcode.state import SUMMARY_SYSTEM, Observation, View
-from jevcode.tools import Workspace, action_menu, project_instructions
-from jevcode.ui import UI
-from jevcode.util import extract_json
+from rift.decisions import ActionDecision, CompletionDecision, GateDecision, ProgressDecision
+from rift.llm import LLMResult, UsageMeter
+from rift.repl import App, handle_command
+from rift.safety import classify_path, classify_shell
+from rift.state import SUMMARY_SYSTEM, Observation, View
+from rift.tools import Workspace, action_menu, project_instructions
+from rift.ui import UI
+from rift.util import extract_json
+from rift.web import html_to_text, parse_search_results, reject_url
 
 
 class FakeUI:
@@ -53,8 +54,11 @@ class FakeUI:
     def rule(self, level, reason) -> None:
         self.events.append(("rule", level, reason))
 
-    def tool(self, name, summary, detail) -> None:
+    def tool(self, name, summary, detail, paths=()) -> None:
         self.events.append(("tool", name, summary))
+
+    def trace(self, text: str) -> None:
+        self.events.append(("trace", text))
 
     def info(self, text: str) -> None:
         self.events.append(text)
@@ -196,10 +200,56 @@ class ToolTests(unittest.TestCase):
     def test_blocked_shell_does_not_run(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             workspace = Workspace(Path(raw))
-            with patch("jevcode.tools.subprocess.run", side_effect=AssertionError("ran")):
+            with patch("rift.tools.subprocess.run", side_effect=AssertionError("ran")):
                 result = workspace.shell("rm -rf /", 5, approved=True)
             self.assertFalse(result.ok)
             self.assertEqual(result.summary, "blocked")
+
+    def test_delete_file_removes_one_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            workspace = Workspace(root)
+            (root / "gone.py").write_text("x = 1\n", encoding="utf-8")
+            (root / "keep").mkdir()
+            removed = workspace.delete_file("gone.py", approved=True)
+            self.assertTrue(removed.ok)
+            self.assertFalse((root / "gone.py").exists())
+            directory = workspace.delete_file("keep", approved=True)
+            self.assertFalse(directory.ok)
+            outside = workspace.delete_file("../nope.py", approved=True)
+            self.assertFalse(outside.ok)
+
+    def test_replace_text_updates_contents_and_directory_names(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            pkg = root / "alpha"
+            pkg.mkdir()
+            (pkg / "app.py").write_text("import alpha\n", encoding="utf-8")
+            (root / "note.md").write_text("run alpha\n", encoding="utf-8")
+            (root / ".env").write_text("TOKEN=alpha\n", encoding="utf-8")
+            result = Workspace(root).replace_text("alpha", "beta", "", False)
+            self.assertTrue(result.ok)
+            self.assertEqual((root / "beta" / "app.py").read_text(encoding="utf-8"), "import beta\n")
+            self.assertEqual((root / "note.md").read_text(encoding="utf-8"), "run beta\n")
+            self.assertEqual((root / ".env").read_text(encoding="utf-8"), "TOKEN=alpha\n")
+
+    def test_edit_batch_applies_each_block(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            workspace = Workspace(root)
+            (root / "a.py").write_text("one\n", encoding="utf-8")
+            (root / "b.py").write_text("two\n", encoding="utf-8")
+            result = workspace.edit_batch(
+                [
+                    {"path": "a.py", "old_string": "one", "new_string": "1", "replace_all": False},
+                    {"path": "b.py", "old_string": "two", "new_string": "2", "replace_all": False},
+                ],
+                True,
+            )
+            self.assertTrue(result.ok)
+            self.assertEqual((root / "a.py").read_text(encoding="utf-8"), "1\n")
+            self.assertEqual((root / "b.py").read_text(encoding="utf-8"), "2\n")
+            self.assertEqual(result.paths, ("a.py", "b.py"))
 
 
 class ParseTests(unittest.TestCase):
@@ -277,6 +327,27 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(tools, ["shell"])
             self.assertIn(("decision", "shell"), [event for event in ui.events if isinstance(event, tuple)])
 
+    def test_repo_replace_is_one_step(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "app.py").write_text("print('alpha')\n", encoding="utf-8")
+            (root / "note.md").write_text("see alpha\n", encoding="utf-8")
+            ui = FakeUI()
+            llm = FakeLLM(json.dumps({"old": "alpha", "new": "beta"}))
+            agent = Agent(
+                workspace=Workspace(root),
+                decisions=FakeDecisions(["read_file", "done"]),
+                llm=llm,
+                ui=ui,
+                settings=settings(root),
+            )
+            summary = agent.run_task("change all instances of alpha to beta")
+            self.assertEqual(summary, "Added hello.py")
+            self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "print('beta')\n")
+            self.assertEqual((root / "note.md").read_text(encoding="utf-8"), "see beta\n")
+            tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
+            self.assertEqual(tools, ["replace_text"])
+
 
 class InstructionTests(unittest.TestCase):
     def test_test_means_run_the_suite(self) -> None:
@@ -331,7 +402,7 @@ class InstructionTests(unittest.TestCase):
                 ui=ui,
                 settings=settings(root, max_steps=1),
             )
-            with patch("jevcode.tools.subprocess.run", side_effect=AssertionError("ran")):
+            with patch("rift.tools.subprocess.run", side_effect=AssertionError("ran")):
                 agent.run_task("delete the disk")
             self.assertEqual((root / "keep.txt").read_text(encoding="utf-8"), "safe")
             self.assertIn(("rule", "block", "recursive delete of a root or home path is blocked"), ui.events)
@@ -435,7 +506,47 @@ class SlashCommandTests(unittest.TestCase):
             self.assertTrue(handle_command(app, "/clear"))
             self.assertEqual(agent.prior, [])
             ui.banner(str(root), "openai", "gpt-4.1-mini", "jev-latest", "")
-            self.assertIn("jevcode", buf.getvalue())
+            self.assertIn("rift", buf.getvalue())
+
+
+class WebAndMenuTests(unittest.TestCase):
+    def test_menu_includes_the_agent_actions(self) -> None:
+        menu = action_menu(False)
+        for name in ("read_file", "grep", "write_file", "web_search", "web_fetch", "think", "todo", "delete_file"):
+            self.assertIn(name, menu)
+
+    def test_fetch_rejects_non_public_urls(self) -> None:
+        self.assertTrue(reject_url("file:///etc/passwd"))
+        self.assertTrue(reject_url("http://169.254.169.254/latest"))
+        self.assertFalse(reject_url("https://example.com/docs"))
+
+    def test_search_results_and_page_text(self) -> None:
+        html = (
+            '<a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fdocs">Docs</a>'
+            '<div class="result__snippet">The <b>docs</b> page.</div>'
+        )
+        hits = parse_search_results(html)
+        self.assertEqual(hits[0][1], "https://example.com/docs")
+        self.assertIn("docs", hits[0][2])
+        page = html_to_text("<style>x</style><p>Hello <b>there</b></p>")
+        self.assertIn("Hello", page)
+        self.assertNotIn("<b>", page)
+
+    def test_a_second_thought_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            llm = FakeLLM(json.dumps({"thought": "Rename the package, then run the tests."}))
+            ui = FakeUI()
+            agent = Agent(
+                workspace=Workspace(root),
+                decisions=FakeDecisions(["think", "think"]),
+                llm=llm,
+                ui=ui,
+                settings=settings(root, max_steps=2),
+            )
+            agent.run_task("rename the package")
+            self.assertEqual(llm.meter.llm_calls, 1)
+            self.assertTrue(any(event == ("trace", "skipped a second thought") for event in ui.events))
 
 
 class _StubLLM:

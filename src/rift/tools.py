@@ -10,15 +10,15 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from jevcode.safety import classify_path, classify_shell
-from jevcode.util import clip
+from rift.safety import classify_path, classify_shell
+from rift.util import clip
 
 SKIP_DIRS = {
     ".git",
     ".hg",
     ".svn",
     ".venv",
-    ".jevcode",
+    ".rift",
     ".mypy_cache",
     ".pytest_cache",
     ".tox",
@@ -41,13 +41,13 @@ class ToolSpec:
 TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         "read_file",
-        "Read a specific file whose contents are not already loaded and are needed next.",
+        "Read a file. Use this when the file contents are not already loaded and the next edit or answer depends on them.",
         'Keys: "path" (required), "offset" (1-based line, default 1), "limit" (lines, default 400, max 800).',
         True,
     ),
     ToolSpec(
         "grep",
-        "Find a symbol, string, or error inside file contents.",
+        "Grep file contents for a symbol, string, or error. Prefer this over reading whole files when you need to find where something lives.",
         'Keys: "pattern" (required, Python regex), "path" (default "."), "glob" (optional, for example *.py).',
         True,
     ),
@@ -65,15 +65,57 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "edit_file",
-        "Change an existing file with one exact replacement. Only after that file and the test or spec for the change are both loaded.",
+        "Change one existing file with one exact replacement. For the same text in many files, use replace_text. For several different edits, use edit_batch.",
         'Keys: "path" (required), "old_string" (exact text, required), "new_string" (required), "replace_all" (default false).',
         False,
     ),
     ToolSpec(
+        "edit_batch",
+        "Apply many different edits in one step. Each edit is one exact replacement in one file.",
+        'Keys: "edits" (required list of objects with path, old_string, new_string, and optional replace_all). At most 40.',
+        False,
+    ),
+    ToolSpec(
+        "replace_text",
+        "Replace one exact string everywhere, including file and directory names. Use this for a rename or any repo-wide text change. One call, not one call per file.",
+        'Keys: "old" (required), "new" (required), "glob" (optional, for example *.py).',
+        False,
+    ),
+    ToolSpec(
         "write_file",
-        "Create a new file, or replace a whole file when a small edit cannot express the change.",
+        "Write a new file. Do not use this when the file already exists; edit it instead.",
         'Keys: "path" (required), "content" (full new text, required).',
         False,
+    ),
+    ToolSpec(
+        "delete_file",
+        "Delete one file inside the workspace. Not for directories.",
+        'Keys: "path" (required).',
+        False,
+    ),
+    ToolSpec(
+        "web_search",
+        "Search the web for a current fact, an API, or a doc that is not in the repo.",
+        'Keys: "query" (required).',
+        True,
+    ),
+    ToolSpec(
+        "web_fetch",
+        "Fetch one http or https page and read its text. Use this after web_search, or when the user gave a url.",
+        'Keys: "url" (required).',
+        True,
+    ),
+    ToolSpec(
+        "think",
+        "Write a short plan before a task with several parts. Use once, then act. Do not think twice in a row.",
+        'Keys: "thought" (required, a few sentences).',
+        True,
+    ),
+    ToolSpec(
+        "todo",
+        "Replace the task list for a multi-part job. Mark the current item in_progress and finished items completed.",
+        'Keys: "todos" (required list of objects with "content" and "status": pending, in_progress, or completed).',
+        True,
     ),
     ToolSpec(
         "shell",
@@ -109,6 +151,7 @@ class ToolResult:
     ok: bool
     summary: str
     detail: str
+    paths: tuple[str, ...] = ()
 
 
 class ToolError(Exception):
@@ -198,6 +241,7 @@ class Workspace:
         except re.error as error:
             return ToolResult(False, "bad regex", str(error))
         hits: list[str] = []
+        cap = 200
         files: list[Path]
         if base.is_file():
             files = [base]
@@ -211,7 +255,7 @@ class Workspace:
                         continue
                     files.append(Path(dirpath) / name)
         for path in files:
-            if len(hits) >= 40:
+            if len(hits) >= cap:
                 break
             if not path.is_file() or path.stat().st_size > 1_000_000:
                 continue
@@ -222,10 +266,10 @@ class Workspace:
             for number, line in enumerate(text.splitlines(), start=1):
                 if regex.search(line):
                     hits.append(f"{self.display(path)}:{number}: {clip(line.strip(), 200)}")
-                    if len(hits) >= 40:
+                    if len(hits) >= cap:
                         break
         body = "\n".join(hits) or "(no matches)"
-        suffix = "" if len(hits) < 40 else " (capped)"
+        suffix = "" if len(hits) < cap else " (capped)"
         return ToolResult(True, f"{len(hits)} hits{suffix}", body)
 
     def read_file(self, raw: str, offset: int, limit: int) -> ToolResult:
@@ -281,7 +325,71 @@ class Workspace:
             updated = updated.replace("\n", "\r\n")
         path.write_text(updated, encoding="utf-8")
         diff = unified_diff(original, updated, self.display(path))
-        return ToolResult(True, f"edited {self.display(path)}", diff)
+        return ToolResult(True, f"edited {self.display(path)}", diff, (self.display(path),))
+
+    def edit_batch(self, edits: list[dict], approved: bool) -> ToolResult:
+        diffs: list[str] = []
+        changed: list[str] = []
+        errors: list[str] = []
+        for edit in edits:
+            result = self.edit_file(
+                str(edit.get("path", "")),
+                str(edit.get("old_string", "")),
+                str(edit.get("new_string", "")),
+                bool(edit.get("replace_all")),
+                approved,
+            )
+            if result.ok:
+                changed.extend(result.paths)
+                if result.detail:
+                    diffs.append(result.detail)
+            else:
+                errors.append(f"{edit.get('path', '')}: {result.summary}")
+        if not changed:
+            return ToolResult(False, "no edits applied", "\n".join(errors) or "nothing to edit")
+        detail = "\n".join(diffs)
+        if errors:
+            detail = detail + "\n" + "\n".join(errors)
+        failed = f", {len(errors)} failed" if errors else ""
+        return ToolResult(True, f"edited {len(changed)} files{failed}", detail, tuple(changed))
+
+    def replace_text(self, old: str, new: str, file_glob: str, _approved: bool) -> ToolResult:
+        if not old or old == new:
+            return ToolResult(False, "bad replacement", "old and new must differ")
+        changed: list[str] = []
+        diffs: list[str] = []
+        skipped: list[str] = []
+        for path in self._text_files(file_glob):
+            verdict = classify_path(path)
+            if verdict.level != "allow":
+                skipped.append(self.display(path))
+                continue
+            try:
+                original = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if old not in original:
+                continue
+            updated = original.replace(old, new)
+            path.write_text(updated, encoding="utf-8")
+            changed.append(self.display(path))
+            diffs.append(unified_diff(original, updated, self.display(path), max_lines=20))
+        renamed = self._rename_paths_containing(old, new)
+        changed = [rel.replace(old, new) for rel in changed]
+        for rel in renamed:
+            if rel not in changed:
+                changed.append(rel)
+        if not changed:
+            detail = "no matches"
+            if skipped:
+                detail += "\nskipped: " + ", ".join(skipped)
+            return ToolResult(False, "nothing replaced", detail)
+        detail = "\n".join(diffs)
+        if renamed:
+            detail += "\nrenamed:\n" + "\n".join(renamed)
+        if skipped:
+            detail += "\nskipped: " + ", ".join(skipped)
+        return ToolResult(True, f"edited {len(changed)} files", clip(detail, 16000), tuple(changed))
 
     def write_file(self, raw: str, content: str, approved: bool) -> ToolResult:
         try:
@@ -302,7 +410,22 @@ class Workspace:
                 return ToolResult(False, "refusing to overwrite a binary file", raw)
         path.write_text(content, encoding="utf-8")
         diff = unified_diff(original, content, self.display(path))
-        return ToolResult(True, f"wrote {self.display(path)} ({len(content)} chars)", diff)
+        return ToolResult(True, f"wrote {self.display(path)} ({len(content)} chars)", diff, (self.display(path),))
+
+    def delete_file(self, raw: str, approved: bool) -> ToolResult:
+        try:
+            path = self.resolve(raw)
+        except ToolError as error:
+            return ToolResult(False, "path rejected", str(error))
+        sensitive = classify_path(path)
+        if sensitive.level == "confirm" and not approved:
+            return ToolResult(False, "not approved", sensitive.reason)
+        if not path.exists():
+            return ToolResult(False, "file not found", raw)
+        if not path.is_file():
+            return ToolResult(False, "refusing to delete a directory", raw)
+        path.unlink()
+        return ToolResult(True, f"deleted {self.display(path)}", "", (self.display(path),))
 
     def shell(self, command: str, timeout: int, approved: bool) -> ToolResult:
         verdict = classify_shell(command)
@@ -346,6 +469,43 @@ class Workspace:
             if len(excerpts) >= 2:
                 break
         return "\n".join(excerpts)
+
+    def _text_files(self, file_glob: str) -> list[Path]:
+        found: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [name for name in dirnames if not _skip_dir(name)]
+            for name in filenames:
+                path = Path(dirpath) / name
+                rel = path.relative_to(self.root).as_posix()
+                if file_glob and not _glob_match(rel, name, file_glob):
+                    continue
+                if path.stat().st_size > 1_000_000:
+                    continue
+                found.append(path)
+        return found
+
+    def _rename_paths_containing(self, old: str, new: str) -> list[str]:
+        if len(old) < 3:
+            return []
+        candidates: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [name for name in dirnames if not _skip_dir(name)]
+            for name in list(dirnames) + list(filenames):
+                if old in name:
+                    candidates.append(Path(dirpath) / name)
+        candidates.sort(key=lambda path: len(path.parts), reverse=True)
+        renamed: list[str] = []
+        for path in candidates:
+            if not path.exists() or old not in path.name:
+                continue
+            if classify_path(path).level != "allow":
+                continue
+            target = path.with_name(path.name.replace(old, new))
+            if target.exists():
+                continue
+            path.rename(target)
+            renamed.append(self.display(target))
+        return renamed
 
     def read_text_if_small(self, raw: str, limit: int = 120_000) -> str:
         path = self.resolve(raw)
@@ -425,7 +585,7 @@ def project_instructions(root: Path, home: Path | None = None) -> str:
     for directory in _instruction_directories(root_path, home_path):
         for name in ("AGENTS.md", "agents.md", "CLAUDE.md", "claude.md"):
             add(directory / name)
-    for name in ("jevcode.md", ".cursorrules"):
+    for name in ("rift.md", ".cursorrules"):
         add(root_path / name)
 
     parts: list[str] = []

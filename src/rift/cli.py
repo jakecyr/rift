@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typesafe_sdk import TypeSafeClient
 
-from jevcode.agent import Agent
-from jevcode.config import fail, load_settings, print_doctor, validate
-from jevcode.decisions import DecisionLayer
-from jevcode.llm import UsageMeter
-from jevcode.repl import App, llm_from_settings, run_repl
-from jevcode.tools import Workspace
-from jevcode.ui import UI
+from rift.agent import Agent
+from rift.config import fail, load_settings, print_doctor, validate
+from rift.decisions import DecisionLayer
+from rift.llm import UsageMeter
+from rift.repl import App, llm_from_settings, run_repl
+from rift.tools import Workspace
+from rift.ui import UI
 
 
 def main(argv: list[str] | None = None) -> int:

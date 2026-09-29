@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from jevcode.util import clip
+from rift.util import clip
 
 BASE_CONSTRAINTS = [
     "Stay inside the workspace.",
@@ -52,6 +52,7 @@ class View:
     observations: list[Observation] = field(default_factory=list)
     guidance: str = ""
     prior_tasks: list[str] = field(default_factory=list)
+    todos: list[dict[str, str]] = field(default_factory=list)
 
     def remember_file(self, path: str, content: str) -> None:
         self.loaded.pop(path, None)
@@ -70,7 +71,17 @@ def jev_state(view: View) -> dict:
             "args": clip(item.args_preview, 240),
             "summary": clip(item.summary, 400),
         }
-        if item.detail and item.tool in {"read_file", "grep", "edit_file", "write_file", "shell"}:
+        if item.detail and item.tool in {
+            "read_file",
+            "grep",
+            "edit_file",
+            "write_file",
+            "shell",
+            "web_search",
+            "web_fetch",
+            "think",
+            "todo",
+        }:
             entry["evidence"] = clip(item.detail, 700)
         recent.append(entry)
     state = {
@@ -88,6 +99,8 @@ def jev_state(view: View) -> dict:
         state["guidance"] = view.guidance
     if view.prior_tasks:
         state["prior_tasks"] = view.prior_tasks[-4:]
+    if view.todos:
+        state["todos"] = view.todos
     return state
 
 
@@ -108,6 +121,9 @@ def llm_user_message(view: View, tool_name: str, arg_help: str) -> str:
         sections.append("Guidance:\n" + view.guidance)
     if view.prior_tasks:
         sections.append("Earlier tasks:\n" + "\n".join(view.prior_tasks[-4:]))
+    if view.todos:
+        lines = [f"- {item['status']}: {item['content']}" for item in view.todos]
+        sections.append("Task list:\n" + "\n".join(lines))
     if view.loaded:
         sections.append("Loaded files (exact text you may copy):\n" + _loaded_block(view))
     if view.observations:
@@ -137,6 +153,16 @@ def _observation_block(view: View) -> str:
     lines: list[str] = []
     for item in view.observations[-6:]:
         lines.append(f"- {item.tool} ok={item.ok} {clip(item.summary, 300)}")
-        if item.detail and item.tool in {"shell", "grep", "edit_file", "write_file", "ask_user"}:
+        if item.detail and item.tool in {
+            "shell",
+            "grep",
+            "edit_file",
+            "write_file",
+            "ask_user",
+            "web_search",
+            "web_fetch",
+            "think",
+            "todo",
+        }:
             lines.append(clip(item.detail, 2500))
     return "\n".join(lines)

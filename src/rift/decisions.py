@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 
 from typesafe_sdk import Choice, Noul, Score, TypeSafeError
 
-from jevcode.llm import UsageMeter
-from jevcode.util import clip
+from rift.llm import UsageMeter
+from rift.util import clip
 
 
 class DecisionError(Exception):
@@ -60,13 +60,22 @@ class DecisionLayer:
                 instructions=(
                     "Choose the single next action for a coding agent. "
                     "Use the evidence in state: the goal, loaded files, and recent tool results. "
+                    "Use grep to find a string and read_file to read a file. "
+                    "Use web_search or web_fetch when the fact is outside the repo. "
+                    "Use think once to plan a task with several parts, then act. Do not think twice in a row. "
+                    "Use todo to track those parts. "
+                    "Use delete_file to remove one file, not a directory. "
+                    "If the goal replaces one string everywhere, pick replace_text once. "
+                    "Do not read each file and do not edit them one by one. "
+                    "If several files need different edits, pick edit_batch once. "
+                    "Use edit_file only for a single snippet. "
                     "If the goal is to run tests, including a goal that is only the word test, pick shell. "
                     "Do not read a test file before that test command has run. "
                     "After a test command fails, use its output, then read only the file that failed. "
-                    "Read a test or spec before editing when the goal is to change or fix code. "
+                    "Read a test or spec before editing only when the goal is to change behavior or fix a failure. "
+                    "A rename does not need the test file. "
                     "Pick the narrowest action that unlocks the goal. "
                     "Do not pick done unless the requested change is saved or the test command already exited 0. "
-                    "Do not pick edit_file unless that file's contents are already loaded and the failing test or spec has been read. "
                     "Do not pick write_file for a file that should be edited in place."
                 ),
                 criteria=menu,

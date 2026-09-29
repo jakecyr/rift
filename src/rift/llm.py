@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from jevcode.util import clip
+from rift.util import clip
 
 
 class GenerationError(Exception):

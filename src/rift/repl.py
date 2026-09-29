@@ -14,7 +14,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from typesafe_sdk import TypeSafeClient
 
-from jevcode.config import (
+from rift.config import (
     DEFAULT_MODELS,
     PROVIDERS,
     refresh_settings,
@@ -22,9 +22,9 @@ from jevcode.config import (
     save_user_key,
     user_config_dir,
 )
-from jevcode.llm import LLM, Profile
-from jevcode.tools import Workspace
-from jevcode.ui import short_path
+from rift.llm import LLM, Profile
+from rift.tools import Workspace
+from rift.ui import short_path
 
 
 class App:
@@ -177,7 +177,7 @@ def run_repl(app: App) -> int:
                     bottom_toolbar=lambda: _toolbar(app),
                 ).strip()
             else:
-                line = input("jevcode> ").strip()
+                line = input("rift> ").strip()
         except (EOFError, KeyboardInterrupt):
             app.ui.console.print()
             return 0
@@ -305,7 +305,7 @@ def _set_key(app: App, args: list[str]) -> None:
         app.rebind_jev()
     else:
         app.rebuild_writer()
-    app.ui.info(f"{kind} key saved in ~/.jevcode/.env")
+    app.ui.info(f"{kind} key saved in ~/.rift/.env")
 
 
 def _set_workspace(app: App, args: list[str]) -> None:
