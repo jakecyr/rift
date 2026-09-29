@@ -884,9 +884,11 @@ class GitTaskTests(unittest.TestCase):
             )
             with patch("rift.tools.subprocess.run", side_effect=AssertionError("ran")):
                 summary = agent.run_task("list the workspace")
-            self.assertIn("policy blocked an action twice", summary)
+            self.assertIn("repeated the same action", summary)
             tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
             self.assertEqual(tools, [])
+            gates = [event for event in ui.events if isinstance(event, tuple) and event[0] == "gate"]
+            self.assertEqual(len(gates), 1)
 
     def test_snapshot_is_visible_before_any_tool(self) -> None:
         view = View(
@@ -1296,6 +1298,147 @@ class ActionCoverageTests(unittest.TestCase):
                     self.assertIn(f"User request:\n{request}", llm.plan_users[0])
                     self.assertEqual(decisions.states[0]["plan"], ["git status"])
                     self.assertEqual(decisions.states[0]["goal"], request)
+
+
+class RobustnessTests(unittest.TestCase):
+    def test_status_spins_only_on_a_terminal(self) -> None:
+        buf = StringIO()
+        ui = UI(verbose=True, console=Console(file=buf, force_terminal=False, width=80))
+        with ui.status("planning with fake"):
+            pass
+        self.assertIn("planning with fake", buf.getvalue())
+
+    def test_planning_reports_status_before_the_first_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            ui = FakeUI()
+            agent = Agent(
+                Workspace(root),
+                AnsweredDecisions(["done"]),
+                FakeLLM("{}", summary="Nothing to do.", plan=_plan("Look around", [], "no files change")),
+                ui,
+                settings(root, max_steps=2),
+            )
+            agent.run_task("look around")
+            self.assertTrue(any(isinstance(event, str) and event.startswith("planning with ") for event in ui.events))
+
+    def test_a_failed_command_waits_for_a_file_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fail = "python3 -c 'raise SystemExit(1)'"
+            llm = ToolReplyLLM(
+                {
+                    "shell": [json.dumps({"command": fail}), json.dumps({"command": fail}), json.dumps({"command": fail})],
+                    "write_file": [json.dumps({"path": "notes.txt", "content": "fixed\n"})],
+                },
+                summary="Updated notes and reran the check.",
+                plan=_plan("Fix the check", ["run the check", "edit notes", "run the check"], "the check exits 0"),
+            )
+            agent = Agent(
+                Workspace(root),
+                FakeDecisions(["shell", "shell", "write_file", "shell", "done"]),
+                llm,
+                FakeUI(),
+                settings(root, max_steps=6),
+            )
+            summary = agent.run_task("fix the failing check")
+            self.assertEqual(summary, "Updated notes and reran the check.")
+            shells = [item for item in agent.last_view.observations if item.tool == "shell"]
+            ran = [item for item in shells if item.summary != "duplicate"]
+            skipped = [item for item in shells if item.summary == "duplicate"]
+            self.assertEqual(len(ran), 2)
+            self.assertEqual(len(skipped), 1)
+            self.assertFalse(ran[0].ok)
+            self.assertEqual((root / "notes.txt").read_text(encoding="utf-8"), "fixed\n")
+
+    def test_a_third_failing_test_command_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            llm = ToolReplyLLM(
+                {
+                    "shell": [
+                        json.dumps({"command": "python3 -c 'raise SystemExit(\"pytest failed\")'"}),
+                        json.dumps({"command": "python3 -c 'raise SystemExit(\"pytest -x failed\")'"}),
+                        json.dumps({"command": "python3 -c 'raise SystemExit(\"pytest -k failed\")'"}),
+                    ]
+                }
+            )
+            agent = Agent(
+                Workspace(root),
+                FakeDecisions(["shell", "shell", "shell", "shell"]),
+                llm,
+                FakeUI(),
+                settings(root, max_steps=5),
+            )
+            summary = agent.run_task("run the tests")
+            self.assertIn("repeated the same action", summary)
+            ran = [
+                item
+                for item in agent.last_view.observations
+                if item.tool == "shell" and item.summary != "duplicate"
+            ]
+            self.assertEqual(len(ran), 2)
+            self.assertTrue(all(not item.ok for item in ran))
+
+    def test_distinct_blocked_commands_still_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            llm = ToolReplyLLM(
+                {"shell": [json.dumps({"command": "ls"}), json.dumps({"command": "pwd"})]}
+            )
+            agent = Agent(
+                Workspace(root),
+                BlockingDecisions(["shell", "shell", "shell"]),
+                llm,
+                FakeUI(),
+                settings(root, max_steps=4),
+            )
+            with patch("rift.tools.subprocess.run", side_effect=AssertionError("ran")):
+                summary = agent.run_task("list the workspace")
+            self.assertIn("policy blocked an action twice", summary)
+
+    def test_a_missing_read_points_back_at_the_file(self) -> None:
+        refusal = json.dumps(
+            {"need": "read_file", "path": "src/rift/ui.py", "reason": "truncated before the status method"}
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "src" / "rift").mkdir(parents=True)
+            (root / "src" / "rift" / "ui.py").write_text("class UI:\n    pass\n", encoding="utf-8")
+            llm = ToolReplyLLM(
+                {"edit_file": [refusal]},
+                summary="Nothing to change.",
+                plan=_plan("Edit ui.py", ["edit ui.py"], "status exists"),
+            )
+            decisions = AnsweredDecisions(["edit_file", "done"])
+            agent = Agent(Workspace(root), decisions, llm, FakeUI(), settings(root))
+            summary = agent.run_task("add a planning loader")
+            self.assertEqual(summary, "Nothing to change.")
+            guidance = decisions.states[-1]["guidance"]
+            self.assertIn("Pick read_file", guidance)
+            self.assertIn("src/rift/ui.py", guidance)
+            self.assertNotIn("Do not pick edit_file again", guidance)
+
+    def test_loaded_text_keeps_every_region(self) -> None:
+        view = View(goal="edit", constraints=[], workspace=".", tree="", project_instructions="")
+        view.remember_file("ui.py", "class UI:\n    def status(self):\n        pass\n", note="lines 1-3 of 3")
+        view.remember_file("ui.py", "def status(self):", note="lines 2-2 of 3")
+        self.assertIn("class UI:", view.loaded["ui.py"])
+        self.assertEqual(view.loaded_notes["ui.py"], "lines 1-3 of 3")
+        view.remember_file("ui.py", "tail of the file")
+        self.assertIn("class UI:", view.loaded["ui.py"])
+        self.assertIn("tail of the file", view.loaded["ui.py"])
+        view.remember_file("ui.py", "just the new file\n", replace=True)
+        self.assertEqual(view.loaded["ui.py"], "just the new file\n")
+        self.assertNotIn("ui.py", view.loaded_notes)
+
+    def test_a_small_file_survives_beside_a_large_one(self) -> None:
+        view = View(goal="edit ui", constraints=[], workspace=".", tree="", project_instructions="")
+        view.remember_file("big.py", "B" * 60_000, note="lines 1-1 of 1")
+        view.remember_file("ui.py", "def status(self, text: str):\n    return spinner\n", note="lines 1-2 of 2")
+        text = llm_user_message(view, "edit_file", "path, old_string, new_string")
+        self.assertIn("def status(self, text: str):", text)
+        self.assertIn("lines 1-2 of 2", text)
 
 
 class ApprovingUI(FakeUI):

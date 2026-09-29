@@ -9,6 +9,7 @@ that a finished task really landed.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
 from rift.decisions import (
     ActionDecision,
@@ -72,6 +73,9 @@ class Agent:
             return self._finish_run(started, view, self._stop("interrupted", view))
         files_changed: list[str] = []
         seen: dict[str, int] = {}
+        shell_basis: dict[str, int] = {}
+        failed_tests = 0
+        test_basis = -1
         done_attempts = 0
         stuck_strikes = 0
         executed = 0
@@ -126,6 +130,28 @@ class Agent:
                     view.observations.append(Observation("think", "", "skipped", view.guidance, False))
                     self.ui.trace("skipped a second thought")
                     continue
+                if _writer_refused(view.guidance, action.name):
+                    key = action.name + ":refused"
+                    seen[key] = seen.get(key, 0) + 1
+                    view.observations.append(
+                        Observation(action.name, "", "duplicate", "The writer already refused this tool.", False)
+                    )
+                    self.ui.trace("skipped a refused tool")
+                    if seen[key] >= 3:
+                        summary = self._stop("repeated the same action", view)
+                        break
+                    continue
+                if "Pick read_file" in view.guidance and action.name in MUTATING - {"shell"}:
+                    key = action.name + ":needs-read"
+                    seen[key] = seen.get(key, 0) + 1
+                    view.observations.append(
+                        Observation(action.name, "", "duplicate", "Read the file before editing it.", False)
+                    )
+                    self.ui.trace("skipped an edit that still needs a read")
+                    if seen[key] >= 4:
+                        summary = self._stop("repeated the same action", view)
+                        break
+                    continue
                 args, refusal = self._arguments(view, action)
                 if refusal is not None:
                     signature = action.name + ":refusal:" + clip(refusal.detail, 800)
@@ -154,13 +180,56 @@ class Agent:
                             summary = self._stop("repeated the same action", view)
                             break
                         continue
+                if action.name == "shell" and refusal is None:
+                    assert args is not None
+                    command = str(args.get("command", ""))
+                    basis = len(files_changed)
+                    if shell_basis.get(signature) == basis:
+                        seen[signature] = seen.get(signature, 0) + 1
+                        blocked = _shell_was_blocked(view, command)
+                        view.observations.append(
+                            Observation(
+                                "shell",
+                                clip(signature, 200),
+                                "duplicate",
+                                "This command already ran. Choose a different one.",
+                                False,
+                            )
+                        )
+                        view.guidance = (
+                            "That shell command already ran and no file has changed since. "
+                            "Check recent_actions for its result. "
+                            "If it failed, edit the cause before running it again. "
+                            "If done_when already holds, pick done. Otherwise pick a different action."
+                        )
+                        self.ui.trace("skipped a repeated command")
+                        if blocked or seen[signature] >= 2:
+                            summary = self._stop("repeated the same action", view)
+                            break
+                        continue
+                    if _is_test_command(command) and basis != test_basis:
+                        failed_tests = 0
+                    if _is_test_command(command) and failed_tests >= 2 and test_basis == basis:
+                        view.observations.append(
+                            Observation(
+                                "shell",
+                                clip(command, 200),
+                                "duplicate",
+                                "Test commands already failed. Edit the cause before running them again.",
+                                False,
+                            )
+                        )
+                        view.guidance = (
+                            "Two test commands already failed and no file has changed. "
+                            "Edit the cause before running tests again."
+                        )
+                        self.ui.trace("skipped another failing test")
+                        summary = self._stop("repeated the same action", view)
+                        break
+                    shell_basis[signature] = basis
                 if refusal is not None:
                     view.observations.append(refusal)
-                    view.guidance = (
-                        f"The writer could not fill {action.name}: {clip(refusal.detail, 400)} "
-                        f"Do not pick {action.name} again for this step. "
-                        "If done_when already holds, pick done. Otherwise pick a different tool."
-                    )
+                    view.guidance = _refusal_guidance(action.name, refusal.detail)
                     self.ui.info(f"        {refusal.summary}: {clip(refusal.detail, 200)}")
                     continue
                 assert args is not None
@@ -199,12 +268,31 @@ class Agent:
                 if result.ok and action.name == "read_file":
                     rel = self._display(str(args.get("path", "")))
                     if rel:
-                        view.remember_file(rel, result.detail)
+                        view.remember_file(rel, result.detail, note=result.summary)
+                    if "Pick read_file" in view.guidance:
+                        view.guidance = ""
+                if action.name == "shell" and _is_test_command(str(args.get("command", ""))):
+                    if result.ok:
+                        failed_tests = 0
+                    else:
+                        if test_basis != len(files_changed):
+                            failed_tests = 0
+                        test_basis = len(files_changed)
+                        failed_tests += 1
                 if result.ok:
                     self._failures = 0
+                    if action.name in MUTATING and _stale_failure_guidance(view.guidance):
+                        failed_tests = 0
+                        test_basis = -1
+                        view.guidance = ""
                 else:
                     self._failures += 1
-                    if self._failures >= 2:
+                    if action.name == "shell":
+                        view.guidance = (
+                            "That command failed. Do not run the same command again until a file changes. "
+                            "Use the error output to edit the cause, or pick a different command."
+                        )
+                    elif self._failures >= 2:
                         view.guidance = (
                             "Those actions failed. Do not repeat them. "
                             "Use the error output for one narrower step, or ask_user."
@@ -227,8 +315,8 @@ class Agent:
         A reply that cannot be parsed leaves the request as the goal and the loop runs unplanned.
         """
         tools = list(action_menu(self.settings.read_only))
-        self.ui.status(f"        planning with {self._model_name('powerful')}")
-        result = self._generate("powerful", PLAN_SYSTEM, plan_user_message(view, tools), 4096, 0.2)
+        with self._busy(f"planning with {self._model_name('powerful')}"):
+            result = self._generate("powerful", PLAN_SYSTEM, plan_user_message(view, tools), 4096, 0.2)
         if result is None:
             self.ui.trace("no plan; running the request as written")
             return
@@ -291,13 +379,14 @@ class Agent:
             view.observations.append(Observation("done", "", "completion rejected", reason, False))
             self.ui.info(f"        rejected: {reason}")
             return None
-        result = self.llm.complete(
-            "powerful",
-            SUMMARY_SYSTEM,
-            llm_user_message(view, "done", "Plain text summary of the work."),
-            800,
-            0.2,
-        )
+        with self._busy(f"writing the note with {self._model_name('powerful')}"):
+            result = self.llm.complete(
+                "powerful",
+                SUMMARY_SYSTEM,
+                llm_user_message(view, "done", "Plain text summary of the work."),
+                800,
+                0.2,
+            )
         self.ui.finished(result.text)
         return result.text.strip()
 
@@ -318,26 +407,28 @@ class Agent:
             )
         max_tokens = 16384 if action.name in {"edit_file", "write_file", "edit_batch"} else 4096
         system = argument_system(view.project_instructions)
-        self.ui.status(f"        writing arguments with {self._model_name(action.tier)}")
-        result = self._generate(action.tier, system, user, max_tokens, 0.0)
-        if result is None:
-            return None, Observation(action.name, "", f"could not fill {action.name}", "the model returned no text", False)
-        try:
-            args = extract_json(result.text)
-        except ValueError:
-            retry = self._generate(
-                action.tier,
-                system,
-                user + "\n\nYour previous reply was not one JSON object. Reply with only JSON.",
-                max_tokens,
-                0.0,
-            )
-            if retry is None:
-                return None, Observation(action.name, "", "invalid arguments", "the model returned no text", False)
+        with self._busy(f"writing with {self._model_name(action.tier)}"):
+            result = self._generate(action.tier, system, user, max_tokens, 0.0)
+            if result is None:
+                return None, Observation(
+                    action.name, "", f"could not fill {action.name}", "the model returned no text", False
+                )
             try:
-                args = extract_json(retry.text)
-            except ValueError as error:
-                return None, Observation(action.name, "", "invalid arguments", str(error), False)
+                args = extract_json(result.text)
+            except ValueError:
+                retry = self._generate(
+                    action.tier,
+                    system,
+                    user + "\n\nYour previous reply was not one JSON object. Reply with only JSON.",
+                    max_tokens,
+                    0.0,
+                )
+                if retry is None:
+                    return None, Observation(action.name, "", "invalid arguments", "the model returned no text", False)
+                try:
+                    args = extract_json(retry.text)
+                except ValueError as error:
+                    return None, Observation(action.name, "", "invalid arguments", str(error), False)
         if isinstance(args.get("need"), str) and not _has_payload(action.name, args):
             detail = f"need {args.get('need', '')} {args.get('path', '')}: {args.get('reason', '')}".strip()
             return None, Observation(action.name, "", f"could not fill {action.name}", detail, False)
@@ -482,13 +573,14 @@ class Agent:
 
     def _ask(self, view: View, tier: str) -> bool:
         try:
-            result = self.llm.complete(
-                tier,
-                ASK_SYSTEM,
-                llm_user_message(view, "ask_user", "One question."),
-                400,
-                0.2,
-            )
+            with self._busy(f"writing a question with {self._model_name(tier)}"):
+                result = self.llm.complete(
+                    tier,
+                    ASK_SYSTEM,
+                    llm_user_message(view, "ask_user", "One question."),
+                    400,
+                    0.2,
+                )
             question = result.text.strip()
         except GenerationError as error:
             self.ui.error(str(error))
@@ -564,13 +656,20 @@ class Agent:
         except ToolError:
             return
         if text:
-            view.remember_file(rel, text)
+            view.remember_file(rel, text, replace=True)
 
     def _display(self, raw: str) -> str:
         try:
             return self.workspace.display(self.workspace.resolve(raw))
         except ToolError:
             return ""
+
+    def _busy(self, text: str):
+        """Enter a status spinner. A UI that returns nothing still lets the call run."""
+        status = self.ui.status(text)
+        if status is None or not hasattr(status, "__enter__"):
+            return nullcontext()
+        return status
 
     def _route_enabled(self) -> bool:
         return bool(self.settings.fast_model and self.settings.fast_provider)
@@ -588,6 +687,38 @@ class Agent:
         text = f"Stopped: {reason}. Last action: {last}."
         self.ui.error(text)
         return text
+
+
+def _writer_refused(guidance: str, tool: str) -> bool:
+    return f"Do not pick {tool} again" in guidance
+
+
+def _refusal_guidance(tool: str, detail: str) -> str:
+    if detail.startswith("need read_file"):
+        return (
+            f"The writer could not fill {tool} because the loaded text is missing or truncated. "
+            f"{clip(detail, 400)} "
+            "Pick read_file for that path at the offset that contains the snippet, then fill the edit."
+        )
+    return (
+        f"The writer could not fill {tool}: {clip(detail, 400)} "
+        f"Do not pick {tool} again for this step. "
+        "If done_when already holds, pick done. Otherwise pick a different tool."
+    )
+
+
+def _shell_was_blocked(view: View, command: str) -> bool:
+    for item in reversed(view.observations):
+        if item.tool != "shell":
+            continue
+        if command and command not in item.args_preview and command not in item.detail:
+            continue
+        return item.summary in {"blocked", "blocked by policy", "denied"}
+    return False
+
+
+def _stale_failure_guidance(guidance: str) -> bool:
+    return guidance.startswith("That command failed") or guidance.startswith("Two test commands")
 
 
 def _ran_a_command(view: View) -> bool:

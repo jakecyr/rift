@@ -14,6 +14,7 @@ BASE_CONSTRAINTS = [
     "Use shell to run tests and builds, not to read files.",
     "Run Python with python3. The command python may be an older interpreter.",
     "Copy old_string from loaded file text. Do not invent surrounding code.",
+    "Do not repeat a shell command that failed until a file has changed.",
 ]
 
 ARG_SYSTEM = """You fill JSON arguments for one tool that was already chosen.
@@ -21,6 +22,7 @@ Return one JSON object and no other text.
 Do not choose a different tool.
 old_string must be copied exactly from the loaded file text, including whitespace.
 If the loaded text is missing or truncated so you cannot copy an exact snippet, return {"need":"read_file","path":"the/file","reason":"why"}.
+If recent actions show a shell command failed and no file has changed since, do not fill that same command.
 write_file and edit_file take one path. When the goal needs several files, fill the single next file that is not already in files changed. Do not return {"need":"ask_user"} because other files remain. The loop will call you again for the rest.
 If the tool cannot be filled for any other reason, return {"need":"ask_user","path":"","reason":"why"}."""
 
@@ -32,7 +34,7 @@ PLAN_SYSTEM = """You plan one coding-agent task before any tool runs. Think it t
 {"task": "...", "steps": ["...", "..."], "done_when": "..."}
 
 task: the user's request as a standalone instruction. Resolve words such as "again", "it", or "that" from the earlier requests. Keep the user's scope. Do not add work they did not ask for.
-steps: 0 to 8 short steps in order. Each step is one tool action with a concrete target: read a named file, grep for a symbol, run a named command, edit a named file. Use the workspace snapshot and the project instructions for real paths, branches, and commands. Leave out a step when its result is already in the snapshot. When a step writes or runs something, say what it is.
+steps: 0 to 8 short steps in order. Each step is one tool action with a concrete target: read a named file, grep for a symbol, run a named command, edit a named file. Use the workspace snapshot and the project instructions for real paths, branches, and commands. Leave out a step when its result is already in the snapshot. When a step writes or runs something, say what it is. If a command fails, the next step is to read the error and edit the cause, not to run that command again.
 done_when: one observable condition that proves the task is finished, for example a command exiting 0, a commit existing, or a file containing the change.
 
 A question the snapshot already answers needs no steps.
@@ -68,12 +70,30 @@ class View:
     guidance: str = ""
     prior_tasks: list[str] = field(default_factory=list)
     todos: list[dict[str, str]] = field(default_factory=list)
+    loaded_notes: dict[str, str] = field(default_factory=dict)
 
-    def remember_file(self, path: str, content: str) -> None:
+    def remember_file(self, path: str, content: str, *, replace: bool = False, note: str = "") -> None:
+        """Keep every region of a path that has been read.
+
+        A later read of a window already in hand does not replace the fuller copy.
+        Disjoint windows are kept together. replace=True is for a file that was just written.
+        """
+        current = self.loaded.get(path, "")
+        if not replace and current and content and content in current:
+            self.loaded.pop(path, None)
+            self.loaded[path] = current
+            return
+        if not replace and current and content and current not in content:
+            content = f"{current}\n\n...[another region]...\n\n{content}"
         self.loaded.pop(path, None)
         self.loaded[path] = content[:120_000]
+        if note:
+            self.loaded_notes[path] = note
+        elif replace:
+            self.loaded_notes.pop(path, None)
         while len(self.loaded) > 6:
             oldest = next(iter(self.loaded))
+            self.loaded_notes.pop(oldest, None)
             del self.loaded[oldest]
 
 
@@ -179,16 +199,26 @@ def state_is_large(state: dict) -> bool:
 
 
 def _loaded_block(view: View) -> str:
-    blocks: list[str] = []
+    """Share the prompt budget so one large file cannot push another out of view."""
+    items = list(reversed(list(view.loaded.items())))
     budget = 48_000
-    for path, content in reversed(list(view.loaded.items())):
-        header = f"--- {path} ({len(content)} chars) ---"
-        room = budget - len(header) - 2
-        if room < 500:
+    blocks: list[str] = []
+    remaining = len(items)
+    for path, content in items:
+        if budget < 500 or remaining <= 0:
             break
+        cap = min(budget, max(8_000, budget // remaining))
+        note = view.loaded_notes.get(path, "")
+        label = f"{len(content)} chars" + (f"; {note}" if note else "")
+        header = f"--- {path} ({label}) ---"
+        room = cap - len(header) - 2
+        remaining -= 1
+        if room < 200:
+            continue
         body = content if len(content) <= room else content[:room] + "\n...[file truncated, read a narrower offset]"
-        blocks.append(f"{header}\n{body}")
-        budget -= len(blocks[-1])
+        piece = f"{header}\n{body}"
+        blocks.append(piece)
+        budget -= len(piece)
     return "\n\n".join(reversed(blocks))
 
 

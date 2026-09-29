@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from rich.console import Console
@@ -97,8 +98,15 @@ class UI:
             grid.add_row("env files", "\n".join(escape(path) for path in settings.env_files))
         self.console.print(Panel(grid, title="doctor", border_style="cyan", padding=(1, 2)))
 
-    def status(self, text: str) -> None:
+    @contextmanager
+    def status(self, text: str):
+        """A spinner while a model call is in flight. Safe when there is no terminal."""
         self.trace(text)
+        if self.console.is_terminal:
+            with self.console.status(text):
+                yield
+            return
+        yield
 
     def plan(self, task: str, steps: list[str], done_when: str) -> None:
         if not task and not steps:
