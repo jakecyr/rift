@@ -1,7 +1,9 @@
 """The agent loop.
 
-Jev chooses and gates. The language model only writes arguments and the final note.
-Code owns limits, path sandboxing, and the proof that a finished task really landed on disk.
+The writer plans the task before any tool runs. Jev chooses each action against
+that plan and gates edits and shell calls. The writer fills arguments and the
+final note. Code owns limits, path sandboxing, hard safety rules, and the proof
+that a finished task really landed.
 """
 
 from __future__ import annotations
@@ -14,27 +16,20 @@ from rift.decisions import (
     DecisionError,
     GateDecision,
 )
-from rift.gitstatus import (
-    GitPlan,
-    GitSnapshot,
-    capture_git,
-    git_add_command,
-    git_commit_command,
-    mixed_shell_problem,
-    plan_git,
-)
-from rift.llm import GenerationError
+from rift.gitstatus import capture_git, secret_staging
+from rift.llm import GenerationError, LLMResult
 from rift.prompt import argument_system
 from rift.safety import Verdict, allow, block, classify_path, classify_shell, confirm
 from rift.state import (
     ASK_SYSTEM,
     BASE_CONSTRAINTS,
-    COMMIT_SYSTEM,
+    PLAN_SYSTEM,
     SUMMARY_SYSTEM,
     Observation,
     View,
     jev_state,
     llm_user_message,
+    plan_user_message,
     state_is_large,
 )
 from rift.tools import SPECS, ToolError, ToolResult, Workspace, action_menu, project_instructions, unified_diff
@@ -52,44 +47,29 @@ class Agent:
         self.ui = ui
         self.settings = settings
         self.prior: list[str] = []
-        self.last_goal: str = ""
-        self._held_edits = 0
         self._blocks = 0
         self._failures = 0
 
     def run_task(self, goal: str) -> str:
-        incoming = goal.strip()
-        if self.last_goal and _is_retry_request(incoming):
-            goal = self.last_goal
-        else:
-            goal = incoming
-            self.last_goal = goal
+        request = goal.strip()
         started = self.llm.meter.snapshot()
         self._blocks = 0
         self._failures = 0
-        self._held_edits = 0
-        snapshot: GitSnapshot = capture_git(self.workspace.root)
         view = View(
-            goal=goal,
+            goal=request,
+            request=request,
             constraints=[*BASE_CONSTRAINTS, *self.settings.constraints],
             workspace=str(self.workspace.root),
             tree=self.workspace.tree(),
             project_instructions=project_instructions(self.workspace.root),
-            snapshot=snapshot.text,
+            snapshot=capture_git(self.workspace.root).text,
             prior_tasks=list(self.prior),
         )
         self.last_view = view
-        git_plan = plan_git(view.goal, self.workspace.root, snapshot)
-        if git_plan is not None:
-            summary = ""
-            try:
-                summary = self._run_git_task(view, git_plan)
-            except GenerationError as error:
-                self.ui.error(str(error))
-                summary = self._stop(str(error), view)
-            except KeyboardInterrupt:
-                summary = self._stop("interrupted", view)
-            return self._finish_run(started, view, summary)
+        try:
+            self._plan(view)
+        except KeyboardInterrupt:
+            return self._finish_run(started, view, self._stop("interrupted", view))
         files_changed: list[str] = []
         seen: dict[str, int] = {}
         done_attempts = 0
@@ -118,30 +98,6 @@ class Agent:
                         self.ui.error(str(error))
                         summary = self._stop(str(error), view)
                         break
-                if wants_test_run(view.goal) and not _ran_shell(view):
-                    if self.settings.read_only:
-                        summary = self._stop("running tests needs shell, and this session is read-only", view)
-                        break
-                    if action.name != "shell":
-                        action = ActionDecision("shell", 0.95, {"shell": 0.95}, action.tier, action.request_id)
-                if wants_repo_replace(view.goal) and not _ran_replace(view):
-                    if self.settings.read_only:
-                        summary = self._stop("a repo-wide replace needs write access", view)
-                        break
-                    if action.name != "replace_text":
-                        action = ActionDecision(
-                            "replace_text", 0.95, {"replace_text": 0.95}, action.tier, action.request_id
-                        )
-                if (
-                    wants_project_guide(view.goal)
-                    and not _guide_sources_loaded(view)
-                    and action.name in {"write_file", "edit_file", "edit_batch", "done"}
-                ):
-                    view.guidance = (
-                        "Read README.md and pyproject.toml before writing the instruction file. "
-                        "Name this repo's layout and test command. Do not write generic advice."
-                    )
-                    action = ActionDecision("read_file", 0.95, {"read_file": 0.95}, action.tier, action.request_id)
                 self.ui.decision(
                     step,
                     action.name,
@@ -170,34 +126,6 @@ class Agent:
                     view.observations.append(Observation("think", "", "skipped", view.guidance, False))
                     self.ui.trace("skipped a second thought")
                     continue
-                uncertain_edit = action.name in MUTATING and action.confidence < 0.6
-                mechanical = action.name in {"edit_batch", "replace_text"} or wants_repo_replace(view.goal)
-                if (
-                    not mechanical
-                    and uncertain_edit
-                    and (action.confidence < 0.45 or not _spec_is_loaded(view))
-                ):
-                    fallback = None if _spec_is_loaded(view) else fallback_action(action)
-                    if fallback is not None:
-                        self.ui.trace(
-                            f"held {action.name} at {action.confidence:.2f}; using {fallback.name}"
-                        )
-                        action = fallback
-                    else:
-                        ranked = _ranked(action.probabilities)
-                        view.guidance = (
-                            "Do not edit yet. Read the test file or run the tests first. "
-                            f"The last uncertain choice was {action.name} at {action.confidence:.2f} ({ranked})."
-                        )
-                        view.observations.append(
-                            Observation(action.name, "", "skipped", view.guidance, False)
-                        )
-                        self.ui.trace("skipped a low-confidence change")
-                        self._held_edits += 1
-                        if self._held_edits >= 4:
-                            summary = self._stop("held an uncertain edit four times", view)
-                            break
-                        continue
                 args, refusal = self._arguments(view, action)
                 if refusal is not None:
                     signature = action.name + ":refusal:" + clip(refusal.detail, 800)
@@ -263,7 +191,6 @@ class Agent:
                     if rel:
                         view.remember_file(rel, result.detail)
                 if result.ok:
-                    self._held_edits = 0
                     self._failures = 0
                 else:
                     self._failures += 1
@@ -284,95 +211,49 @@ class Agent:
             summary = self._stop("interrupted", view)
         return self._finish_run(started, view, summary, files_changed)
 
-    def _run_git_task(self, view: View, plan: GitPlan) -> str:
-        """Review from the snapshot, then stage and commit when that was the request.
+    def _plan(self, view: View) -> None:
+        """Think before acting: restate the request, list the steps, and say what proves it done.
 
-        The diff is already captured. The only writes are git add and git commit.
+        A reply that cannot be parsed leaves the request as the goal and the loop runs unplanned.
         """
-        if not plan.is_repo:
-            return self._stop(view.snapshot or "this workspace is not a git repository", view)
-        if plan.commit and self.settings.read_only:
-            return self._stop("committing needs shell, and this session is read-only", view)
-        if plan.held:
-            view.guidance = "Left unstaged because they look like secrets: " + ", ".join(plan.held)
-        if plan.commit and not plan.paths:
-            note = "Nothing to commit."
-            if plan.held:
-                note += " Left unstaged: " + ", ".join(plan.held) + "."
-            self.ui.finished(note)
-            return note
-        if plan.commit:
-            message = self._commit_message(view)
-            if not self._run_git_command(view, git_add_command(plan.paths), 1):
-                return self._stop("git add failed", view)
-            commit = git_commit_command(message)
-            if not self._run_git_command(view, commit, 2):
-                if _needs_identity(view):
-                    commit = git_commit_command(message, identity=True)
-                    if not self._run_git_command(view, commit, 3):
-                        return self._stop("git commit failed", view)
-                else:
-                    return self._stop("git commit failed", view)
-            view.files_changed = list(plan.paths)
-            note = "The commit succeeded. Summarize the diff from the snapshot and the subject. The snapshot is the work that was committed."
-            if plan.held:
-                note += " Left unstaged: " + ", ".join(plan.held) + "."
-            view.guidance = note
-        elif not plan.paths and not plan.held:
-            note = "No uncommitted changes."
-            self.ui.finished(note)
-            return note
-        result = self.llm.complete(
-            "powerful",
-            SUMMARY_SYSTEM,
-            llm_user_message(view, "done", "Plain text summary of the diff and the commit."),
-            800,
-            0.2,
-        )
-        self.ui.finished(result.text)
-        return result.text.strip()
+        tools = list(action_menu(self.settings.read_only))
+        self.ui.status(f"        planning with {self._model_name('powerful')}")
+        result = self._generate("powerful", PLAN_SYSTEM, plan_user_message(view, tools), 4096, 0.2)
+        if result is None:
+            self.ui.trace("no plan; running the request as written")
+            return
+        try:
+            data = extract_json(result.text)
+        except ValueError:
+            self.ui.trace("plan was not JSON; running the request as written")
+            return
+        task = _string(data.get("task"))
+        if task:
+            view.goal = clip(task, 2000)
+        steps = data.get("steps")
+        if isinstance(steps, list):
+            view.plan = [clip(_string(step), 300) for step in steps if _string(step)][:8]
+        view.done_when = clip(_string(data.get("done_when")), 400)
+        restated = view.goal if view.goal != view.request else ""
+        self.ui.plan(restated, view.plan, view.done_when)
 
-    def _commit_message(self, view: View) -> str:
-        """One subject line. An empty reply falls back so add and commit still run."""
-        prompt = llm_user_message(view, "commit", "One subject line.")
-        for effort in ("low", "off"):
-            try:
-                result = self.llm.complete(
-                    "powerful",
-                    COMMIT_SYSTEM,
-                    prompt,
-                    2048,
-                    0.2,
-                    effort=effort,
-                )
-            except GenerationError:
-                continue
-            line = _commit_subject(result.text)
-            if line:
-                return line
-        return "Apply the current workspace changes"
-
-    def _run_git_command(self, view: View, command: str, step: int) -> bool:
-        verdict = classify_shell(command)
-        if verdict.level == "block":
-            self.ui.rule("block", verdict.reason)
-            view.observations.append(Observation("shell", command, "blocked", verdict.reason, False))
-            return False
-        if verdict.level == "confirm" or self.settings.confirm_mutations:
-            if not self.ui.confirm(self._confirm_message("shell", {"command": command}), True):
-                view.observations.append(Observation("shell", command, "denied", "a person denied this action", False))
-                return False
-        self.ui.decision(step, "shell", 1.0, "powerful", {"shell": 1.0}, "")
-        result = self._execute("shell", {"command": command, "timeout_sec": 120})
-        view.observations.append(Observation("shell", command, result.summary, result.detail, result.ok))
-        self.ui.tool("shell", result.summary, result.detail)
-        return result.ok
+    def _generate(self, tier: str, system: str, user: str, max_tokens: int, temperature: float) -> LLMResult | None:
+        """One generation with one retry. Reasoning models can spend a budget and return no text."""
+        try:
+            return self.llm.complete(tier, system, user, max_tokens, temperature)
+        except GenerationError as error:
+            self.ui.trace(f"retrying after: {error}")
+        try:
+            return self.llm.complete(tier, system, user, max_tokens, temperature, effort="low")
+        except GenerationError as error:
+            self.ui.error(str(error))
+            return None
 
     def _finish_run(self, started, view: View, summary: str, files_changed: list[str] | None = None) -> str:
         files = list(view.files_changed if files_changed is None else files_changed)
         self.ui.stats(self.llm.meter.delta(started), files)
         if summary:
-            note = clip(summary, 500)
+            note = f"Request: {clip(view.goal, 400)}\nResult: {clip(summary, 500)}"
             if note not in self.prior:
                 self.prior.append(note)
             self.prior = self.prior[-6:]
@@ -387,17 +268,10 @@ class Agent:
             view.observations.append(Observation("done", "", "completion check failed", str(error), False))
             self.ui.error(str(error))
             return None
-        passed, reason = prove_completion(verdict, files_changed, self.workspace)
+        passed, reason = prove_completion(verdict, files_changed, self.workspace, _ran_a_command(view))
         if not passed and files_changed and latest_test_passed(view):
             passed = True
             reason = "the test command exited 0 after the last edit"
-        if wants_test_run(view.goal):
-            if _test_command_passed(view):
-                passed = True
-                reason = "the test command exited 0"
-            else:
-                passed = False
-                reason = "the test command has not exited 0"
         self.ui.trace(
             f"complete {verdict.complete:.2f}  needs_file_changes {verdict.needs_file_changes:.2f}"
         )
@@ -422,46 +296,36 @@ class Agent:
         if spec is None:
             return None, Observation(action.name, "", "unknown tool", action.name, False)
         user = llm_user_message(view, action.name, spec.arg_help)
-        if action.name == "shell" and wants_test_run(view.goal):
-            user += (
-                "\n\nThe user asked to run the test suite. "
-                "Set command to the test command in the project instructions when one is given. "
-                "Otherwise use the runner this repo already uses. Use python3, not python."
-            )
-        if action.name == "shell":
-            user += "\n\nRun one command. Do not chain git with a test runner."
-        if action.name == "replace_text":
-            user += (
-                "\n\nSet old and new from the user message. "
-                "One call replaces the text in every file and in file names. Leave glob empty."
-            )
+        user += (
+            "\n\nFill this tool for the first plan step that the recent actions have not done. "
+            "If a recent result shows the plan is wrong, fill it for the step that the evidence calls for."
+        )
         if action.name in {"write_file", "edit_file"}:
             user += (
                 "\n\nThis tool accepts only one path. "
                 "Fill the single next file that is not already written. "
                 "Do not return need ask_user because other files remain."
             )
-        if action.name in {"write_file", "edit_file"} and wants_project_guide(view.goal):
-            user += (
-                "\n\nThis file is a project guide. Use facts from the loaded README and project files: "
-                "the test command, the package layout, and the conventions. "
-                "Do not write generic advice such as 'follow existing conventions' with no command or path."
-            )
-        max_tokens = 16384 if action.name in {"edit_file", "write_file", "edit_batch"} else 2048
+        max_tokens = 16384 if action.name in {"edit_file", "write_file", "edit_batch"} else 4096
+        system = argument_system(view.project_instructions)
         self.ui.status(f"        writing arguments with {self._model_name(action.tier)}")
-        result = self.llm.complete(action.tier, argument_system(view.project_instructions), user, max_tokens, 0.0)
+        result = self._generate(action.tier, system, user, max_tokens, 0.0)
+        if result is None:
+            return None, Observation(action.name, "", f"could not fill {action.name}", "the model returned no text", False)
         try:
             args = extract_json(result.text)
         except ValueError:
-            result = self.llm.complete(
+            retry = self._generate(
                 action.tier,
-                argument_system(view.project_instructions),
+                system,
                 user + "\n\nYour previous reply was not one JSON object. Reply with only JSON.",
                 max_tokens,
                 0.0,
             )
+            if retry is None:
+                return None, Observation(action.name, "", "invalid arguments", "the model returned no text", False)
             try:
-                args = extract_json(result.text)
+                args = extract_json(retry.text)
             except ValueError as error:
                 return None, Observation(action.name, "", "invalid arguments", str(error), False)
         if isinstance(args.get("need"), str) and not _has_payload(action.name, args):
@@ -470,10 +334,6 @@ class Agent:
         normalized, error = normalize_args(action.name, args)
         if error:
             return None, Observation(action.name, "", "invalid arguments", error, False)
-        if action.name == "shell" and normalized is not None:
-            problem = mixed_shell_problem(str(normalized.get("command", "")))
-            if problem:
-                return None, Observation(action.name, "", "invalid arguments", problem, False)
         return normalized, None
 
     def _permit(self, view: View, state: dict, tool: str, args: dict) -> bool:
@@ -575,7 +435,14 @@ class Agent:
 
     def _code_verdict(self, tool: str, args: dict) -> Verdict:
         if tool == "shell":
-            return classify_shell(str(args.get("command", "")))
+            command = str(args.get("command", ""))
+            verdict = classify_shell(command)
+            if verdict.level != "allow":
+                return verdict
+            secrets = secret_staging(command, self.workspace.root)
+            if secrets:
+                return confirm("this would stage files that can hold secrets: " + ", ".join(secrets))
+            return verdict
         raw_path = str(args.get("path", "."))
         try:
             path = self.workspace.resolve(raw_path)
@@ -713,145 +580,9 @@ class Agent:
         return text
 
 
-_AGAIN = ("again", "agaon", "agian", "agin")
-_RETRY_FILLERS = ("please ", "can you ", "could you ", "just ")
-
-
-def _retry_phrases() -> set[str]:
-    phrases = {"retry", "retry that", "retry it", "same thing"}
-    for word in _AGAIN:
-        phrases.update(
-            {
-                f"try {word}",
-                f"try that {word}",
-                f"try it {word}",
-                f"do that {word}",
-                f"do it {word}",
-                f"run that {word}",
-                f"run it {word}",
-                f"same thing {word}",
-            }
-        )
-    return phrases
-
-
-_RETRY_PHRASES = _retry_phrases()
-
-
-def _is_retry_request(goal: str) -> bool:
-    """True when the whole message asks to repeat the previous goal.
-
-    A coding request that merely contains "again" or "retry" stays a new task.
-    """
-    text = " ".join(goal.strip().lower().split())
-    text = text.strip("\"'`")
-    text = text.rstrip(".!?").strip()
-    changed = True
-    while changed:
-        changed = False
-        for prefix in _RETRY_FILLERS:
-            if text.startswith(prefix):
-                text = text[len(prefix) :].strip()
-                changed = True
-    if text.endswith(" please"):
-        text = text[: -len(" please")].strip()
-    return text in _RETRY_PHRASES
-
-
-def _commit_subject(text: str) -> str:
-    lines = text.strip().splitlines()
-    line = lines[0].strip().strip("\"'`") if lines else ""
-    if not line or line.startswith("{"):
-        return ""
-    return line[:72]
-
-
-def _needs_identity(view: View) -> bool:
-    if not view.observations:
-        return False
-    last = view.observations[-1]
-    text = f"{last.summary}\n{last.detail}".lower()
-    return "please tell me who you are" in text or "user.name" in text or "user.email" in text
-
-
-def fallback_action(action: ActionDecision) -> ActionDecision | None:
-    """When an edit is too uncertain, take the best read instead of spinning."""
-    best_name = ""
-    best_prob = 0.0
-    for name, prob in action.probabilities.items():
-        if name not in {"read_file", "grep", "glob", "list_dir"} or prob < 0.15:
-            continue
-        if prob > best_prob:
-            best_name = name
-            best_prob = float(prob)
-    if not best_name:
-        return None
-    return ActionDecision(best_name, best_prob, action.probabilities, action.tier, action.request_id)
-
-
-def _spec_is_loaded(view: View) -> bool:
-    for path in view.loaded:
-        name = path.rsplit("/", 1)[-1]
-        if name.startswith("test_") or name.endswith("_test.py"):
-            return True
-    return False
-
-
-def _ranked(probabilities: dict[str, float]) -> str:
-    ordered = sorted(probabilities.items(), key=lambda item: -item[1])[:4]
-    return ", ".join(f"{name}={prob:.2f}" for name, prob in ordered)
-
-
-def wants_project_guide(goal: str) -> bool:
-    """The user asked for a project instruction file, which has to describe this repo."""
-    text = goal.lower()
-    return "agents.md" in text or "claude.md" in text
-
-
-def _guide_sources_loaded(view: View) -> bool:
-    loaded = {path.rsplit("/", 1)[-1].lower() for path in view.loaded}
-    return "readme.md" in loaded or "pyproject.toml" in loaded
-
-
-def wants_repo_replace(goal: str) -> bool:
-    """The user asked to change one string everywhere, not to edit files one by one."""
-    text = " ".join(goal.strip().lower().split())
-    return "all instances" in text or "every instance" in text or "everywhere" in text
-
-
-def _ran_replace(view: View) -> bool:
-    return any(item.tool == "replace_text" for item in view.observations)
-
-
-def wants_test_run(goal: str) -> bool:
-    """A bare request to run the suite, not a request to change tests."""
-    text = " ".join(goal.strip().lower().strip(".!?").split())
-    return text in {
-        "test",
-        "tests",
-        "run test",
-        "run tests",
-        "run the test",
-        "run the tests",
-        "run the test suite",
-        "test suite",
-        "npm test",
-        "pytest",
-        "run pytest",
-        "run unittest",
-    }
-
-
-def _ran_shell(view: View) -> bool:
-    return any(item.tool == "shell" for item in view.observations)
-
-
-def _test_command_passed(view: View) -> bool:
-    passed = False
-    for item in view.observations:
-        if item.tool == "shell" and _is_test_command(f"{item.args_preview} {item.summary}"):
-            passed = item.ok
-    return passed
+def _ran_a_command(view: View) -> bool:
+    """A command that exited 0 is work on the machine, even when no file in the tree changed."""
+    return any(item.tool == "shell" and item.ok for item in view.observations)
 
 
 def latest_test_passed(view: View) -> bool:
@@ -872,12 +603,17 @@ def _is_test_command(text: str) -> bool:
     return any(token in lowered for token in ("unittest", "pytest", "npm test", "go test", "cargo test"))
 
 
-def prove_completion(verdict: CompletionDecision, files_changed: list[str], workspace: Workspace) -> tuple[bool, str]:
-    """Jev's belief is not proof. The files have to exist."""
+def prove_completion(
+    verdict: CompletionDecision,
+    files_changed: list[str],
+    workspace: Workspace,
+    ran_command: bool = False,
+) -> tuple[bool, str]:
+    """Jev's belief is not proof. The files have to exist, or a command has to have run."""
     if verdict.complete <= 0.8:
         return False, f"completion belief is {verdict.complete:.2f}; need above 0.80"
-    if verdict.needs_file_changes >= 0.7 and not files_changed:
-        return False, "the goal still needs file changes and none were written"
+    if verdict.needs_file_changes >= 0.7 and not files_changed and not ran_command:
+        return False, "the goal still needs changes and nothing was written or run"
     missing: list[str] = []
     empty: list[str] = []
     for rel in files_changed:

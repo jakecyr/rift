@@ -28,10 +28,15 @@ SUMMARY_SYSTEM = """Write a short completion note for the user.
 Plain text, no JSON. Say what changed, which files, and anything left unfinished.
 Stay under 150 words."""
 
-COMMIT_SYSTEM = """Write one git commit subject for the diff in the workspace snapshot.
-Plain text, one line, at most 72 characters.
-Match the style of the recent commits. Say why the change exists.
-No quotes and no conventional-commit prefix unless the recent commits use one."""
+PLAN_SYSTEM = """You plan one coding-agent task before any tool runs. Think it through, then return one JSON object and no other text:
+{"task": "...", "steps": ["...", "..."], "done_when": "..."}
+
+task: the user's request as a standalone instruction. Resolve words such as "again", "it", or "that" from the earlier requests. Keep the user's scope. Do not add work they did not ask for.
+steps: 0 to 8 short steps in order. Each step is one tool action with a concrete target: read a named file, grep for a symbol, run a named command, edit a named file. Use the workspace snapshot and the project instructions for real paths, branches, and commands. Leave out a step when its result is already in the snapshot. When a step writes or runs something, say what it is.
+done_when: one observable condition that proves the task is finished, for example a command exiting 0, a commit existing, or a file containing the change.
+
+A question the snapshot already answers needs no steps.
+Do not plan destructive, irreversible, or history-rewriting commands the user did not ask for. Do not plan to skip hooks or checks."""
 
 ASK_SYSTEM = """Write one specific question for the user.
 Plain text, no preamble. Ask only for a fact you need in order to continue."""
@@ -54,6 +59,9 @@ class View:
     tree: str
     project_instructions: str
     snapshot: str = ""
+    request: str = ""
+    plan: list[str] = field(default_factory=list)
+    done_when: str = ""
     files_changed: list[str] = field(default_factory=list)
     loaded: dict[str, str] = field(default_factory=dict)
     observations: list[Observation] = field(default_factory=list)
@@ -93,6 +101,8 @@ def jev_state(view: View) -> dict:
         recent.append(entry)
     state = {
         "goal": view.goal,
+        "plan": view.plan,
+        "done_when": view.done_when,
         "constraints": view.constraints,
         "workspace": view.workspace,
         "tree": clip(view.tree, 8000),
@@ -118,6 +128,12 @@ def llm_user_message(view: View, tool_name: str, arg_help: str) -> str:
         f"Selected tool: {tool_name}",
         f"Argument shape: {arg_help}",
         f"Goal:\n{view.goal}",
+    ]
+    if view.plan:
+        sections.append("Plan:\n" + "\n".join(f"{index}. {step}" for index, step in enumerate(view.plan, 1)))
+    if view.done_when:
+        sections.append(f"Done when:\n{view.done_when}")
+    sections += [
         "Constraints:\n" + "\n".join(f"- {item}" for item in view.constraints),
         f"Workspace: {view.workspace}",
         f"Tree:\n{clip(view.tree, 8000)}",
@@ -140,6 +156,22 @@ def llm_user_message(view: View, tool_name: str, arg_help: str) -> str:
     if view.observations:
         sections.append("Recent actions:\n" + _observation_block(view))
     return clip("\n\n".join(sections), 80_000)
+
+
+def plan_user_message(view: View, tools: list[str]) -> str:
+    sections = [
+        f"User request:\n{view.request or view.goal}",
+        "Tools the loop can run:\n" + ", ".join(tools),
+        f"Workspace: {view.workspace}",
+        f"Tree:\n{clip(view.tree, 8000)}",
+    ]
+    if view.prior_tasks:
+        sections.append("Earlier requests and results, oldest first:\n" + "\n\n".join(view.prior_tasks[-4:]))
+    if view.snapshot:
+        sections.append("Workspace snapshot:\n" + clip(view.snapshot, 16_000))
+    if view.project_instructions:
+        sections.append("Project instructions:\n" + clip(view.project_instructions, 4000))
+    return clip("\n\n".join(sections), 60_000)
 
 
 def state_is_large(state: dict) -> bool:

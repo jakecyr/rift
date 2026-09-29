@@ -16,12 +16,9 @@ from rich.console import Console
 
 from rift.agent import (
     Agent,
-    _is_retry_request,
-    fallback_action,
     latest_test_passed,
     normalize_args,
     prove_completion,
-    wants_test_run,
 )
 from rift.config import (
     Settings,
@@ -31,20 +28,14 @@ from rift.config import (
     merge_env,
 )
 from rift.decisions import ActionDecision, CompletionDecision, GateDecision, ProgressDecision
-from rift.gitstatus import (
-    git_add_command,
-    mixed_shell_problem,
-    parse_porcelain,
-    wants_git_commit,
-    wants_git_review,
-)
+from rift.gitstatus import parse_porcelain, secret_staging
 from rift.llm import GenerationError, LLM, LLMResult, Profile, UsageMeter, _openai_text, writer_rates
 from rift.prompt import argument_system
 from rift.repl import App, _toolbar, handle_command, run_bang
 from rift.safety import classify_path, classify_shell
 from rift.state import (
     ARG_SYSTEM,
-    COMMIT_SYSTEM,
+    PLAN_SYSTEM,
     SUMMARY_SYSTEM,
     Observation,
     View,
@@ -63,6 +54,9 @@ class FakeUI:
 
     def status(self, text: str) -> None:
         self.events.append(text)
+
+    def plan(self, task, steps, done_when) -> None:
+        self.events.append(("plan", task, list(steps)))
 
     def decision(self, step, name, confidence, tier, probabilities, request_id) -> None:
         self.events.append(("decision", name))
@@ -86,6 +80,7 @@ class FakeUI:
         self.events.append(text)
 
     def confirm(self, message: str, forced: bool) -> bool:
+        self.events.append(("confirm", message))
         return False
 
     def ask(self, question: str) -> str:
@@ -99,14 +94,19 @@ class FakeUI:
 
 
 class FakeLLM:
-    def __init__(self, payload: str, summary: str = "Added hello.py") -> None:
+    def __init__(self, payload: str, summary: str = "Added hello.py", plan: str = "{}") -> None:
         self.payload = payload
         self.summary = summary
+        self.plan = plan
+        self.plan_users: list[str] = []
         self.meter = UsageMeter()
         self.summaries = 0
 
     def complete(self, tier, system, user, max_tokens, temperature, effort=None) -> LLMResult:
         self.meter.llm_calls += 1
+        if system == PLAN_SYSTEM:
+            self.plan_users.append(user)
+            return LLMResult(self.plan, False, "fake")
         if system == SUMMARY_SYSTEM:
             self.summaries += 1
             return LLMResult(self.summary, False, "fake")
@@ -114,13 +114,16 @@ class FakeLLM:
 
 
 class ToolReplyLLM(FakeLLM):
-    def __init__(self, replies: dict[str, list[str]], summary: str = "Added the files") -> None:
-        super().__init__("{}", summary)
+    def __init__(self, replies: dict[str, list[str]], summary: str = "Added the files", plan: str = "{}") -> None:
+        super().__init__("{}", summary, plan)
         self.replies = {name: list(payloads) for name, payloads in replies.items()}
         self.users: list[str] = []
 
     def complete(self, tier, system, user, max_tokens, temperature, effort=None) -> LLMResult:
         self.meter.llm_calls += 1
+        if system == PLAN_SYSTEM:
+            self.plan_users.append(user)
+            return LLMResult(self.plan, False, "fake")
         self.users.append(user)
         if system == SUMMARY_SYSTEM:
             self.summaries += 1
@@ -135,12 +138,15 @@ class ToolReplyLLM(FakeLLM):
 
 
 class FakeDecisions:
-    def __init__(self, actions: list[str]) -> None:
+    def __init__(self, actions: list[str], confidence: float = 0.96) -> None:
         self.actions = list(actions)
+        self.confidence = confidence
+        self.states: list[dict] = []
 
     def next_action(self, state, menu, route: bool) -> ActionDecision:
+        self.states.append(state)
         name = self.actions.pop(0)
-        return ActionDecision(name, 0.96, {name: 0.96}, "powerful")
+        return ActionDecision(name, self.confidence, {name: self.confidence}, "powerful")
 
     def gate(self, state) -> GateDecision:
         return GateDecision("allow", 0.93, 0.04)
@@ -317,7 +323,7 @@ class ProofTests(unittest.TestCase):
             workspace = Workspace(Path(raw))
             ok, reason = prove_completion(CompletionDecision(0.95, 0.9), [], workspace)
             self.assertFalse(ok)
-            self.assertIn("file changes", reason)
+            self.assertIn("nothing was written or run", reason)
 
     def test_existing_file_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -347,7 +353,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn(("finished", "Added hello.py"), ui.events)
             self.assertEqual(llm.summaries, 1)
 
-    def test_bare_test_runs_the_suite_instead_of_reading(self) -> None:
+    def test_a_test_request_runs_the_suite_through_shell(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             (root / "test_ok.py").write_text(
@@ -361,7 +367,7 @@ class AgentTests(unittest.TestCase):
             llm = FakeLLM(json.dumps({"command": "python3 -m unittest test_ok"}))
             agent = Agent(
                 workspace=Workspace(root),
-                decisions=FakeDecisions(["read_file", "done"]),
+                decisions=FakeDecisions(["shell", "done"]),
                 llm=llm,
                 ui=ui,
                 settings=settings(root),
@@ -381,7 +387,7 @@ class AgentTests(unittest.TestCase):
             llm = FakeLLM(json.dumps({"old": "alpha", "new": "beta"}))
             agent = Agent(
                 workspace=Workspace(root),
-                decisions=FakeDecisions(["read_file", "done"]),
+                decisions=FakeDecisions(["replace_text", "done"]),
                 llm=llm,
                 ui=ui,
                 settings=settings(root),
@@ -393,32 +399,7 @@ class AgentTests(unittest.TestCase):
             tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
             self.assertEqual(tools, ["replace_text"])
 
-    def test_an_instruction_file_is_not_written_before_the_readme(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            (root / "README.md").write_text("# app\n\npython3 -m unittest tests.test_app\n", encoding="utf-8")
-            ui = FakeUI()
-            llm = FakeLLM(json.dumps({"path": "README.md", "offset": 1, "limit": 40}))
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["write_file"]),
-                llm=llm,
-                ui=ui,
-                settings=settings(root, max_steps=1),
-            )
-            agent.run_task("add agents.md file")
-            self.assertFalse((root / "agents.md").exists())
-            tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
-            self.assertEqual(tools, ["read_file"])
-
-
 class InstructionTests(unittest.TestCase):
-    def test_test_means_run_the_suite(self) -> None:
-        self.assertTrue(wants_test_run("test"))
-        self.assertTrue(wants_test_run("Run the tests"))
-        self.assertFalse(wants_test_run("fix the failing test"))
-        self.assertFalse(wants_test_run("add a test for the cart"))
-
     def test_agents_and_claude_files_are_loaded_near_to_far(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw) / "home"
@@ -476,21 +457,6 @@ class InstructionTests(unittest.TestCase):
         self.assertNotIn("write_file", menu)
         self.assertIn("read_file", menu)
         self.assertIn("done", menu)
-
-    def test_uncertain_edit_falls_back_to_reading(self) -> None:
-        action = ActionDecision(
-            "edit_file",
-            0.45,
-            {"edit_file": 0.45, "read_file": 0.37, "shell": 0.18},
-            "powerful",
-        )
-        fallback = fallback_action(action)
-        self.assertIsNotNone(fallback)
-        assert fallback is not None
-        self.assertEqual(fallback.name, "read_file")
-        self.assertIsNone(
-            fallback_action(ActionDecision("edit_file", 0.4, {"edit_file": 0.9, "write_file": 0.1}, "powerful"))
-        )
 
     def test_a_green_test_run_after_an_edit_counts(self) -> None:
         view = View(goal="fix tests", constraints=[], workspace=".", tree="", project_instructions="")
@@ -631,7 +597,8 @@ class WebAndMenuTests(unittest.TestCase):
                 settings=settings(root, max_steps=2),
             )
             agent.run_task("rename the package")
-            self.assertEqual(llm.meter.llm_calls, 1)
+            self.assertEqual(llm.meter.llm_calls, 2)
+            self.assertEqual(len(llm.plan_users), 1)
             self.assertTrue(any(event == ("trace", "skipped a second thought") for event in ui.events))
 
 
@@ -685,7 +652,7 @@ class MultiFileWriteTests(unittest.TestCase):
             ui = FakeUI()
             agent = Agent(
                 workspace=Workspace(root),
-                decisions=FakeDecisions(["write_file", "write_file", "write_file", "done"]),
+                decisions=FakeDecisions(["read_file", "write_file", "write_file", "done"]),
                 llm=llm,
                 ui=ui,
                 settings=settings(root),
@@ -758,23 +725,30 @@ class CostTests(unittest.TestCase):
 
 
 class GitTaskTests(unittest.TestCase):
-    def test_review_words_do_not_steal_a_code_edit(self) -> None:
-        self.assertTrue(wants_git_review("review changes, stage and commit"))
-        self.assertTrue(wants_git_commit("revie wchanges , stage and commit"))
-        self.assertTrue(wants_git_review("revie wchanges , stage and commit"))
-        self.assertFalse(wants_git_commit("commit the helper name to a constant"))
-        self.assertFalse(wants_git_commit("add a commit hook"))
-        self.assertFalse(wants_git_commit("do not commit"))
-        self.assertFalse(wants_git_review("change the review function"))
-        self.assertEqual(mixed_shell_problem("git diff && python3 -m pytest"), "Run git and the tests as separate commands. Do not chain them.")
-        self.assertEqual(mixed_shell_problem("python3 -m pytest"), "")
+    def test_status_paths_and_secret_staging(self) -> None:
         self.assertEqual(
             parse_porcelain(' M README.md\n?? "my file.txt"\nR  old.py -> new.py\n'),
             ["README.md", "my file.txt", "old.py", "new.py"],
         )
-        self.assertTrue(git_add_command(("my file.txt",)).startswith("git add -- "))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _git_init(root)
+            (root / "notes.txt").write_text("notes\n", encoding="utf-8")
+            (root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            self.assertEqual(secret_staging("git add -A", root), [".env"])
+            self.assertEqual(secret_staging("git add .", root), [".env"])
+            self.assertEqual(secret_staging("git add .env", root), [".env"])
+            self.assertEqual(secret_staging("git add notes.txt && git commit -m x", root), [])
+            self.assertEqual(secret_staging("git status", root), [])
+            self.assertEqual(secret_staging("ls", root), [])
 
-    def test_review_stage_and_commit_does_not_read_the_repo(self) -> None:
+    def test_hooks_cannot_be_skipped_silently(self) -> None:
+        self.assertEqual(classify_shell("git commit --no-verify -m x").level, "confirm")
+        self.assertEqual(classify_shell("git commit -n -m x").level, "confirm")
+        self.assertEqual(classify_shell("git push").level, "confirm")
+        self.assertEqual(classify_shell("git commit -m 'ship it'").level, "allow")
+
+    def test_commit_runs_through_the_plan_and_the_loop(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             _git_init(root)
@@ -782,108 +756,80 @@ class GitTaskTests(unittest.TestCase):
             (root / "notes.txt").write_text("ship the notes\n", encoding="utf-8")
             (root / "my file.txt").write_text("spaced\n", encoding="utf-8")
             (root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
-            decisions = FakeDecisions(["read_file", "read_file", "shell"])
-            ui = FakeUI()
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=decisions,
-                llm=FakeLLM("Describe the workspace edits", "Committed the notes."),
-                ui=ui,
-                settings=settings(root),
+            plan = json.dumps(
+                {
+                    "task": "Stage the changed files except .env and commit them",
+                    "steps": ["git add the changed files except .env", "git commit with a subject"],
+                    "done_when": "git log shows the new commit",
+                }
             )
+            llm = ToolReplyLLM(
+                {
+                    "shell": [
+                        json.dumps({"command": "git add -- README.md notes.txt 'my file.txt'"}),
+                        json.dumps({"command": "git commit -m 'Ship the notes'"}),
+                    ]
+                },
+                summary="Committed the notes.",
+                plan=plan,
+            )
+            decisions = FakeDecisions(["shell", "shell", "done"])
+            ui = FakeUI()
+            agent = Agent(Workspace(root), decisions, llm, ui, settings(root))
             with patch.dict(os.environ, _GIT_ENV):
-                summary = agent.run_task("revie wchanges , stage and commit")
+                summary = agent.run_task("commit changes")
             self.assertEqual(summary, "Committed the notes.")
-            self.assertEqual(decisions.actions, ["read_file", "read_file", "shell"])
-            tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
-            self.assertEqual(tools, ["shell", "shell"])
-            subject = _git(root, ["log", "-1", "--format=%s"])
-            self.assertEqual(subject, "Describe the workspace edits")
+            self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "Ship the notes")
             names = _git(root, ["show", "--name-only", "--pretty=format:", "HEAD"])
-            self.assertIn("notes.txt", names)
-            self.assertIn("my file.txt", names)
-            self.assertIn("README.md", names)
+            for name in ("README.md", "notes.txt", "my file.txt"):
+                self.assertIn(name, names)
             self.assertNotIn(".env", names)
-            self.assertIn("shipped", _git(root, ["show", "HEAD:README.md"]))
+            self.assertIn(("plan", "Stage the changed files except .env and commit them", json.loads(plan)["steps"]), ui.events)
+            self.assertEqual(decisions.states[0]["plan"], json.loads(plan)["steps"])
+            self.assertEqual(decisions.states[0]["done_when"], "git log shows the new commit")
+            self.assertIn("M README.md", decisions.states[0]["workspace_snapshot"])
             self.assertNotIn("TOKEN=secret", agent.last_view.snapshot)
-            self.assertIn(".env", _git(root, ["status", "--porcelain"]))
-            commands = " ".join(item.args_preview for item in agent.last_view.observations)
-            self.assertNotIn("pytest", commands)
-            self.assertNotIn("push", commands)
-            self.assertNotIn("--no-verify", commands)
+            self.assertIn("Plan:\n1. git add", llm.users[0])
 
-    def test_review_does_not_create_a_commit(self) -> None:
+    def test_staging_a_secret_needs_a_person(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             _git_init(root)
-            before = _git(root, ["rev-parse", "HEAD"])
-            (root / "notes.txt").write_text("only a review\n", encoding="utf-8")
+            (root / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
             ui = FakeUI()
             agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["read_file"]),
-                llm=FakeLLM("unused", "Notes changed."),
-                ui=ui,
-                settings=settings(root),
+                Workspace(root),
+                FakeDecisions(["shell"]),
+                FakeLLM(json.dumps({"command": "git add -A"})),
+                ui,
+                settings(root, max_steps=1),
             )
-            summary = agent.run_task("review the changes")
-            self.assertEqual(summary, "Notes changed.")
-            self.assertEqual(_git(root, ["rev-parse", "HEAD"]), before)
-            tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
-            self.assertEqual(tools, [])
-            self.assertIn(("finished", "Notes changed."), ui.events)
+            agent.run_task("stage everything")
+            confirms = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "confirm"]
+            self.assertEqual(len(confirms), 1)
+            self.assertIn("git add -A", confirms[0])
+            self.assertEqual(_git(root, ["diff", "--cached", "--name-only"]), "")
 
-    def test_clean_repo_has_nothing_to_commit(self) -> None:
+    def test_push_is_not_held_when_jev_is_unsure(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             _git_init(root)
             ui = FakeUI()
+            llm = FakeLLM(json.dumps({"command": "git push"}))
             agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["read_file"]),
-                llm=FakeLLM("should not be asked"),
-                ui=ui,
-                settings=settings(root),
+                Workspace(root),
+                FakeDecisions(["shell"], confidence=0.3),
+                llm,
+                ui,
+                settings(root, max_steps=1),
             )
-            summary = agent.run_task("stage and commit")
-            self.assertEqual(summary, "Nothing to commit.")
-            self.assertEqual(agent.llm.meter.llm_calls, 0)
-            self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "init")
+            agent.run_task("push changes")
+            confirms = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "confirm"]
+            self.assertEqual(confirms, ["        run shell?\n        git push"])
+            self.assertNotIn("skipped a low-confidence change", " ".join(str(event) for event in ui.events))
+            self.assertEqual(agent.last_view.observations[-1].summary, "denied")
 
-    def test_commit_outside_a_repo_stops(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            ui = FakeUI()
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["read_file"]),
-                llm=FakeLLM("{}"),
-                ui=ui,
-                settings=settings(root),
-            )
-            summary = agent.run_task("stage and commit")
-            self.assertIn("not a git repository", summary)
-            self.assertEqual(agent.llm.meter.llm_calls, 0)
-
-    def test_read_only_refuses_to_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            _git_init(root)
-            (root / "notes.txt").write_text("nope\n", encoding="utf-8")
-            options = settings(root)
-            options.read_only = True
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["shell"]),
-                llm=FakeLLM("should not commit"),
-                ui=FakeUI(),
-                settings=options,
-            )
-            summary = agent.run_task("commit the changes")
-            self.assertIn("read-only", summary)
-            self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "init")
-
-    def test_a_failing_hook_is_not_skipped(self) -> None:
+    def test_a_failing_hook_reaches_the_loop(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             _git_init(root)
@@ -891,21 +837,21 @@ class GitTaskTests(unittest.TestCase):
             hook.write_text("#!/bin/sh\necho hook refused\nexit 1\n", encoding="utf-8")
             hook.chmod(0o755)
             (root / "notes.txt").write_text("blocked by the hook\n", encoding="utf-8")
-            ui = FakeUI()
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["shell"]),
-                llm=FakeLLM("Should not land"),
-                ui=ui,
-                settings=settings(root),
+            llm = ToolReplyLLM(
+                {
+                    "shell": [
+                        json.dumps({"command": "git add notes.txt"}),
+                        json.dumps({"command": "git commit -m 'Should not land'"}),
+                    ]
+                }
             )
+            agent = Agent(Workspace(root), FakeDecisions(["shell", "shell"]), llm, FakeUI(), settings(root, max_steps=2))
             with patch.dict(os.environ, _GIT_ENV):
-                summary = agent.run_task("stage and commit")
-            self.assertIn("git commit failed", summary)
+                agent.run_task("commit changes")
             self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "init")
-            commands = " ".join(item.args_preview for item in agent.last_view.observations)
-            self.assertNotIn("--no-verify", commands)
-            self.assertIn("hook refused", " ".join(item.detail for item in agent.last_view.observations))
+            last = agent.last_view.observations[-1]
+            self.assertFalse(last.ok)
+            self.assertIn("hook refused", last.detail)
 
     def test_policy_blocks_stop_instead_of_spinning(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -924,22 +870,6 @@ class GitTaskTests(unittest.TestCase):
             tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
             self.assertEqual(tools, [])
 
-    def test_git_is_not_chained_to_the_test_suite(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            ui = FakeUI()
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=FakeDecisions(["shell"]),
-                llm=FakeLLM(json.dumps({"command": "git diff && python3 -m pytest"})),
-                ui=ui,
-                settings=settings(root, max_steps=1),
-            )
-            with patch("rift.tools.subprocess.run", side_effect=AssertionError("ran")):
-                agent.run_task("check the formatter")
-            tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
-            self.assertEqual(tools, [])
-
     def test_snapshot_is_visible_before_any_tool(self) -> None:
         view = View(
             goal="review the changes",
@@ -952,116 +882,83 @@ class GitTaskTests(unittest.TestCase):
         self.assertIn("M README.md", llm_user_message(view, "done", "summary"))
         self.assertIn("M README.md", jev_state(view)["workspace_snapshot"])
 
-    def test_empty_reasoning_reply_still_commits(self) -> None:
+    def test_a_successful_command_counts_as_work(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            verdict = CompletionDecision(0.95, 0.9)
+            ok, _reason = prove_completion(verdict, [], Workspace(Path(raw)))
+            self.assertFalse(ok)
+            ok, _reason = prove_completion(verdict, [], Workspace(Path(raw)), ran_command=True)
+            self.assertTrue(ok)
+
+
+class PlanTests(unittest.TestCase):
+    def test_follow_ups_are_resolved_from_earlier_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            llm = FakeLLM("{}", plan=json.dumps({"task": "stage and commit", "steps": [], "done_when": ""}))
+            agent = Agent(Workspace(root), FakeDecisions(["ask_user", "ask_user"]), llm, FakeUI(), settings(root))
+            agent.run_task("stage and commit")
+            agent.run_task("try agaon")
+            self.assertEqual(agent.last_view.request, "try agaon")
+            self.assertEqual(agent.last_view.goal, "stage and commit")
+            self.assertIn("Request: stage and commit", llm.plan_users[1])
+
+    def test_an_unreadable_plan_keeps_the_request(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            llm = FakeLLM("{}", plan="I would read the file first.")
+            agent = Agent(Workspace(root), FakeDecisions(["ask_user"]), llm, FakeUI(), settings(root))
+            agent.run_task("add a retry helper")
+            self.assertEqual(agent.last_view.goal, "add a retry helper")
+            self.assertEqual(agent.last_view.plan, [])
+
+    def test_an_empty_reasoning_reply_is_retried(self) -> None:
         reasoning_only = {
             "choices": [
                 {
                     "finish_reason": "length",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "reasoning", "text": "look at the diff"}],
-                        "refusal": None,
-                    },
+                    "message": {"role": "assistant", "content": [{"type": "reasoning", "text": "thinking"}]},
                 }
             ],
             "usage": {"prompt_tokens": 12, "completion_tokens": 200},
         }
-        summary = {
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "Committed the notes."},
-                }
-            ],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 8},
-        }
+
+        def reply(text: str) -> dict:
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": text}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+            }
+
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            _git_init(root)
-            (root / "notes.txt").write_text("ship the notes\n", encoding="utf-8")
-            llm = LLM(
-                Profile("openai", "gpt-6-luna", "test", "http://example.invalid/v1"),
-                None,
-                UsageMeter(),
-                effort="medium",
-            )
+            llm = LLM(Profile("openai", "gpt-6-luna", "test", "http://example.invalid/v1"), None, UsageMeter())
             calls: list[dict] = []
 
             def fake_post(url, headers, payload):
                 calls.append(dict(payload))
                 system = payload["messages"][0]["content"]
-                if system == COMMIT_SYSTEM:
+                if system == PLAN_SYSTEM:
+                    return reply(json.dumps({"task": "list files", "steps": ["run ls"], "done_when": "ls exits 0"}))
+                if system == SUMMARY_SYSTEM:
+                    return reply("Listed the files.")
+                arg_calls = [call for call in calls if call["messages"][0]["content"] not in {PLAN_SYSTEM, SUMMARY_SYSTEM}]
+                if len(arg_calls) == 1:
                     return reasoning_only
-                return summary
+                return reply(json.dumps({"command": "ls"}))
 
             llm._post = fake_post
-            decisions = FakeDecisions(["read_file"])
             ui = FakeUI()
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=decisions,
-                llm=llm,
-                ui=ui,
-                settings=settings(root),
-            )
+            agent = Agent(Workspace(root), FakeDecisions(["shell", "done"]), llm, ui, settings(root))
             try:
-                with patch.dict(os.environ, _GIT_ENV):
-                    summary_text = agent.run_task("stage and commit")
+                summary = agent.run_task("list files")
             finally:
                 llm.close()
-            self.assertEqual(summary_text, "Committed the notes.")
-            self.assertNotIn("model returned no text", summary_text)
-            self.assertFalse(any(isinstance(event, str) and "model returned no text" in event for event in ui.events))
-            self.assertEqual(llm.effort, "medium")
-            self.assertEqual(decisions.actions, ["read_file"])
-            commit_calls = [payload for payload in calls if payload["messages"][0]["content"] == COMMIT_SYSTEM]
-            self.assertEqual(len(commit_calls), 2)
-            self.assertEqual(commit_calls[0].get("reasoning_effort"), "low")
-            self.assertNotIn("reasoning_effort", commit_calls[1])
-            self.assertGreater(commit_calls[0]["max_completion_tokens"], 200)
-            summary_calls = [payload for payload in calls if payload["messages"][0]["content"] == SUMMARY_SYSTEM]
-            self.assertEqual(summary_calls[0].get("reasoning_effort"), "medium")
+            self.assertEqual(summary, "Listed the files.")
             tools = [event[1] for event in ui.events if isinstance(event, tuple) and event[0] == "tool"]
-            self.assertEqual(tools, ["shell", "shell"])
-            commands = " ".join(item.args_preview for item in agent.last_view.observations)
-            self.assertIn("git add", commands)
-            self.assertIn("git commit", commands)
-            self.assertEqual(_git(root, ["log", "-1", "--format=%s"]), "Apply the current workspace changes")
-            self.assertIn("notes.txt", _git(root, ["show", "--name-only", "--pretty=format:", "HEAD"]))
-
-    def test_try_agaon_repeats_the_last_goal(self) -> None:
-        self.assertTrue(_is_retry_request("try agaon"))
-        self.assertTrue(_is_retry_request("try again"))
-        self.assertTrue(_is_retry_request("retry"))
-        self.assertTrue(_is_retry_request("do that again"))
-        self.assertTrue(_is_retry_request("same thing"))
-        self.assertFalse(_is_retry_request("add a retry helper"))
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            decisions = FakeDecisions(["read_file"])
-            ui = FakeUI()
-            agent = Agent(
-                workspace=Workspace(root),
-                decisions=decisions,
-                llm=FakeLLM("unused"),
-                ui=ui,
-                settings=settings(root),
-            )
-            first = agent.run_task("stage and commit")
-            self.assertIn("not a git repository", first)
-            self.assertEqual(agent.last_goal, "stage and commit")
-            self.assertTrue(agent.prior)
-            self.assertTrue(agent.prior[-1].startswith("Stopped:"))
-            second = agent.run_task("try agaon")
-            self.assertEqual(agent.last_view.goal, "stage and commit")
-            self.assertEqual(agent.last_goal, "stage and commit")
-            self.assertIn("not a git repository", second)
-            self.assertEqual(decisions.actions, ["read_file"])
-            agent.decisions = FakeDecisions(["ask_user"])
-            other = agent.run_task("add a retry helper")
-            self.assertEqual(agent.last_view.goal, "add a retry helper")
-            self.assertEqual(agent.last_goal, "add a retry helper")
-            self.assertNotIn("not a git repository", other)
+            self.assertEqual(tools, ["shell"])
+            arg_calls = [call for call in calls if call["messages"][0]["content"] not in {PLAN_SYSTEM, SUMMARY_SYSTEM}]
+            self.assertEqual(arg_calls[1].get("reasoning_effort"), "low")
+            self.assertEqual(llm.effort, "medium")
 
 
 class OpenAITextTests(unittest.TestCase):

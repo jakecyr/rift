@@ -84,6 +84,8 @@ def classify_shell(command: str) -> Verdict:
             return confirm("kill needs a person")
         if head == "git":
             sub = _git_subcommand(tokens)
+            if "--no-verify" in tokens or (sub == "commit" and "-n" in tokens):
+                return confirm("skipping git hooks needs a person")
             if sub in {"push", "clean", "rebase"}:
                 return confirm(f"git {sub} needs a person")
             if sub == "reset" and "--hard" in tokens:

@@ -100,6 +100,17 @@ class UI:
     def status(self, text: str) -> None:
         self.trace(text)
 
+    def plan(self, task: str, steps: list[str], done_when: str) -> None:
+        if not task and not steps:
+            return
+        self.console.print("\n[bold]plan[/]", highlight=False)
+        if task:
+            self.console.print(f"  [dim]{escape(task)}[/]", highlight=False)
+        for index, step in enumerate(steps, 1):
+            self.console.print(f"  {index}. {escape(step)}", highlight=False)
+        if done_when and self.verbose:
+            self.console.print(f"  [dim]done when {escape(done_when)}[/]", highlight=False)
+
     def trace(self, text: str) -> None:
         if self.verbose and text.strip():
             self.console.print(f"  [dim]{escape(text.strip())}[/]")

@@ -59,30 +59,20 @@ class DecisionLayer:
             "next_action": Choice(
                 instructions=(
                     "Choose the single next action for a coding agent. "
-                    "Use the evidence in state: the goal, loaded files, and recent tool results. "
-                    "Use grep to find a string and read_file to read a file. "
-                    "Use web_search or web_fetch when the fact is outside the repo. "
-                    "Use think once to plan a task with several parts, then act. Do not think twice in a row. "
-                    "Use todo to track those parts. "
-                    "Use delete_file to remove one file, not a directory. "
-                    "If the goal replaces one string everywhere, pick replace_text once. "
-                    "Do not read each file and do not edit them one by one. "
-                    "If several files need different edits, pick edit_batch once. "
-                    "Use edit_file only for a single snippet. "
-                    "If the goal is to run tests, including a goal that is only the word test, pick shell. "
-                    "Do not read a test file before that test command has run. "
-                    "After a test command fails, use its output, then read only the file that failed. "
-                    "Read a test or spec before editing only when the goal is to change behavior or fix a failure. "
-                    "A rename does not need the test file. "
-                    "If the goal is to create or update AGENTS.md or CLAUDE.md, read README.md and pyproject.toml first. "
-                    "The instruction file must name this repo's layout and test command. Do not write generic advice. "
-                    "workspace_snapshot is already the git status, the diff, and recent commits. "
-                    "Do not read source files to discover uncommitted work. "
-                    "Do not run the test suite unless the goal asks for tests. "
-                    "Do not chain git and a test command in one shell call. "
-                    "Pick the narrowest action that unlocks the goal. "
-                    "Do not pick done unless the requested change is saved or the test command already exited 0. "
-                    "Do not pick write_file for a file that should be edited in place."
+                    "State holds the goal, a plan written before any tool ran, done_when, "
+                    "workspace_snapshot (git branch, status, diff, and recent commits), loaded files, "
+                    "and recent tool results. "
+                    "Take the first plan step that recent_actions have not completed, and pick the tool that step needs. "
+                    "Skip a step whose result is already in state. "
+                    "When a result contradicts the plan, follow the evidence instead of the plan. "
+                    "After a failure, use its output for a different next step. Do not repeat the failed action. "
+                    "Use shell for any command the step names: git, builds, tests, package managers, scripts. "
+                    "Use grep or glob to locate code and read_file to read it. "
+                    "Use replace_text when one string changes everywhere, edit_batch for several different edits, "
+                    "and edit_file for one snippet. Do not pick write_file for a file that should be edited in place. "
+                    "Use web_search or web_fetch only for facts outside the repo. "
+                    "Pick ask_user only when a fact only the user knows is missing. "
+                    "Pick done when done_when holds or the question is answered from state."
                 ),
                 criteria=menu,
             )
@@ -191,7 +181,10 @@ class DecisionLayer:
             state,
             {
                 "complete": Noul(
-                    instructions="Every deliverable named in the goal is now present in the workspace evidence."
+                    instructions=(
+                        "Every deliverable named in the goal is now present in the workspace evidence, "
+                        "and done_when holds according to recent tool results."
+                    )
                 ),
                 "needs_file_changes": Noul(
                     instructions="The goal requires files to be created or modified, and that work is not optional."

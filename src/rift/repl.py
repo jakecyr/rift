@@ -118,8 +118,6 @@ def handle_command(app: App, line: str) -> bool:
         return True
     if command == "/clear":
         app.agent.prior.clear()
-        if hasattr(app.agent, "last_goal"):
-            app.agent.last_goal = ""
         app.ui.clear()
         _show_status(app)
         return True
